@@ -59,7 +59,7 @@ final class LocationTracker: NSObject, ObservableObject {
     func stopTracking() {
         locationManager.stopUpdatingLocation()
         locationManager.disallowDeferredLocationUpdates()
-        flushCoordinates()
+        flushCoordinates(forceSave: true)
         currentTrack?.finishedAt = .now
         isTracking = false
         try? modelContext?.save()
@@ -93,9 +93,19 @@ final class LocationTracker: NSObject, ObservableObject {
     }
 
     private func flushCoordinates() {
+        flushCoordinates(forceSave: false)
+    }
+
+    func persistCurrentState() {
+        flushCoordinates(forceSave: true)
+    }
+
+    private func flushCoordinates(forceSave: Bool) {
         guard let modelContext, let currentTrack else { return }
         currentTrack.replaceCoordinates(bufferedCoordinates)
-        try? modelContext.save()
+        if forceSave || bufferedCoordinates.count.isMultiple(of: 25) {
+            try? modelContext.save()
+        }
     }
 }
 

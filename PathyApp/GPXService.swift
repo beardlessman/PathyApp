@@ -15,6 +15,24 @@ enum GPXService {
         return destination
     }
 
+    static func exportAllAsZip(tracks: [Track]) throws -> URL {
+        let sessionID = UUID().uuidString
+        var entries: [ZipArchive.Entry] = []
+        entries.reserveCapacity(tracks.count)
+        for (index, track) in tracks.enumerated() {
+            let safeName = track.name
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: " ", with: "_")
+            let filename = String(format: "%03d_%@.gpx", index + 1, safeName)
+            let data = buildDocument(track: track).data(using: .utf8) ?? Data()
+            entries.append(.init(filename: filename, data: data))
+        }
+
+        let zipURL = FileManager.default.temporaryDirectory.appendingPathComponent("tracks-\(sessionID).zip")
+        try ZipArchive.create(zipURL: zipURL, entries: entries)
+        return zipURL
+    }
+
     static func `import`(from url: URL, modelContext: ModelContext) throws -> Track {
         let data = try Data(contentsOf: url)
         let points = try parseGPX(data: data)
@@ -73,6 +91,112 @@ enum GPXService {
           </trk>
         </gpx>
         """
+    }
+}
+
+private enum ZipArchive {
+    struct Entry {
+        let filename: String
+        let data: Data
+    }
+
+    static func create(zipURL: URL, entries: [Entry]) throws {
+        var archive = Data()
+        var centralDirectory = Data()
+        var localHeaderOffsets: [UInt32] = []
+        localHeaderOffsets.reserveCapacity(entries.count)
+
+        for entry in entries {
+            let filenameData = Data(entry.filename.utf8)
+            let crc = CRC32.checksum(entry.data)
+            let size = UInt32(entry.data.count)
+            let localOffset = UInt32(archive.count)
+            localHeaderOffsets.append(localOffset)
+
+            // Local file header
+            archive.appendLE(UInt32(0x0403_4b50))
+            archive.appendLE(UInt16(20)) // Version needed
+            archive.appendLE(UInt16(0)) // General purpose bit flag
+            archive.appendLE(UInt16(0)) // Compression method (store)
+            archive.appendLE(UInt16(0)) // Last mod time
+            archive.appendLE(UInt16(0)) // Last mod date
+            archive.appendLE(crc)
+            archive.appendLE(size) // Compressed size
+            archive.appendLE(size) // Uncompressed size
+            archive.appendLE(UInt16(filenameData.count))
+            archive.appendLE(UInt16(0)) // Extra field length
+            archive.append(filenameData)
+            archive.append(entry.data)
+        }
+
+        for (index, entry) in entries.enumerated() {
+            let filenameData = Data(entry.filename.utf8)
+            let crc = CRC32.checksum(entry.data)
+            let size = UInt32(entry.data.count)
+
+            // Central directory file header
+            centralDirectory.appendLE(UInt32(0x0201_4b50))
+            centralDirectory.appendLE(UInt16(20)) // Version made by
+            centralDirectory.appendLE(UInt16(20)) // Version needed
+            centralDirectory.appendLE(UInt16(0)) // General purpose bit flag
+            centralDirectory.appendLE(UInt16(0)) // Compression method (store)
+            centralDirectory.appendLE(UInt16(0)) // Last mod time
+            centralDirectory.appendLE(UInt16(0)) // Last mod date
+            centralDirectory.appendLE(crc)
+            centralDirectory.appendLE(size)
+            centralDirectory.appendLE(size)
+            centralDirectory.appendLE(UInt16(filenameData.count))
+            centralDirectory.appendLE(UInt16(0)) // Extra field length
+            centralDirectory.appendLE(UInt16(0)) // File comment length
+            centralDirectory.appendLE(UInt16(0)) // Disk number start
+            centralDirectory.appendLE(UInt16(0)) // Internal file attributes
+            centralDirectory.appendLE(UInt32(0)) // External file attributes
+            centralDirectory.appendLE(localHeaderOffsets[index])
+            centralDirectory.append(filenameData)
+        }
+
+        let centralDirectoryOffset = UInt32(archive.count)
+        archive.append(centralDirectory)
+
+        // End of central directory record
+        archive.appendLE(UInt32(0x0605_4b50))
+        archive.appendLE(UInt16(0)) // Number of this disk
+        archive.appendLE(UInt16(0)) // Number of disk with central directory
+        archive.appendLE(UInt16(entries.count))
+        archive.appendLE(UInt16(entries.count))
+        archive.appendLE(UInt32(centralDirectory.count))
+        archive.appendLE(centralDirectoryOffset)
+        archive.appendLE(UInt16(0)) // ZIP file comment length
+
+        try archive.write(to: zipURL, options: .atomic)
+    }
+}
+
+private enum CRC32 {
+    private static let table: [UInt32] = {
+        (0..<256).map { i in
+            var c = UInt32(i)
+            for _ in 0..<8 {
+                c = (c & 1) == 1 ? (0xEDB8_8320 ^ (c >> 1)) : (c >> 1)
+            }
+            return c
+        }
+    }()
+
+    static func checksum(_ data: Data) -> UInt32 {
+        var crc: UInt32 = 0xFFFF_FFFF
+        for byte in data {
+            let idx = Int((crc ^ UInt32(byte)) & 0xFF)
+            crc = table[idx] ^ (crc >> 8)
+        }
+        return crc ^ 0xFFFF_FFFF
+    }
+}
+
+private extension Data {
+    mutating func appendLE<T: FixedWidthInteger>(_ value: T) {
+        var le = value.littleEndian
+        Swift.withUnsafeBytes(of: &le) { append(contentsOf: $0) }
     }
 }
 

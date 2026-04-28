@@ -13,6 +13,7 @@ import UIKit
 
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var tracker = LocationTracker()
     @State private var tracks: [Track] = []
 
@@ -70,7 +71,6 @@ struct ContentView: View {
                             tracker.stopTracking()
                             if let currentTrack = tracker.currentTrack {
                                 upsertLocalTrack(currentTrack)
-                                try? TrackBackupService.backup(track: currentTrack)
                             }
                             refreshTracks()
                         } else {
@@ -92,8 +92,8 @@ struct ContentView: View {
                 HStack(spacing: 12) {
                     Button("Import GPX") { isImporting = true }
                         .disabled(isBusy)
-                    Button("Export GPX") { exportSelectedTrack() }
-                        .disabled(isBusy || (tracks.first { selectedTrackIDs.contains($0.id) } ?? tracker.currentTrack) == nil)
+                    Button("Export GPX") { exportAllTracks() }
+                        .disabled(isBusy || tracks.isEmpty)
                 }
 
                 List {
@@ -154,9 +154,14 @@ struct ContentView: View {
             .onAppear {
                 tracker.attach(modelContext: modelContext)
                 tracker.requestPermissions()
-                restoreFromBackupsIfNeeded()
                 refreshTracks()
                 syncSelectionWithTracks()
+            }
+            .onChange(of: scenePhase) { _, newPhase in
+                if newPhase != .active {
+                    tracker.persistCurrentState()
+                    refreshTracks()
+                }
             }
             .overlay {
                 if isBusy {
@@ -224,7 +229,6 @@ struct ContentView: View {
 
             do {
                 let track = try GPXService.import(from: url, modelContext: modelContext)
-                try? TrackBackupService.backup(track: track)
                 upsertLocalTrack(track)
                 refreshTracks()
                 selectedTrackIDs.insert(track.id)
@@ -236,11 +240,9 @@ struct ContentView: View {
         }
     }
 
-    private func exportSelectedTrack() {
-        let track = tracks.first { selectedTrackIDs.contains($0.id) } ?? tracker.currentTrack
-        guard let track else { return }
+    private func exportAllTracks() {
         do {
-            exportedURL = try GPXService.export(track: track)
+            exportedURL = try GPXService.exportAllAsZip(tracks: tracks)
         } catch {
             exportError = "Unable to export GPX: \(error.localizedDescription)"
         }
@@ -255,7 +257,6 @@ struct ContentView: View {
                 for track in tracksToDelete {
                     selectedTrackIDs.remove(track.id)
                     knownTrackIDs.remove(track.id)
-                    TrackBackupService.removeBackup(trackID: track.id)
                     modelContext.delete(track)
                 }
                 try modelContext.save()
@@ -302,13 +303,6 @@ struct ContentView: View {
         selectedTrackIDs.insert(track.id)
     }
 
-    private func restoreFromBackupsIfNeeded() {
-        do {
-            _ = try TrackBackupService.restoreIfNeeded(modelContext: modelContext)
-        } catch {
-            exportError = "Backup restore failed: \(error.localizedDescription)"
-        }
-    }
 }
 
 private extension UTType {

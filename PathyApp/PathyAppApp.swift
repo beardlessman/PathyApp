@@ -14,6 +14,6 @@ struct PathyAppApp: App {
         WindowGroup {
             ContentView()
         }
-        .modelContainer(for: [Track.self, TrackPoint.self])
+        .modelContainer(PersistenceController.sharedContainer)
     }
 }
