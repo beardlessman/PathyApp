@@ -48,15 +48,23 @@ enum GPXService {
     private static func buildDocument(track: Track) -> String {
         let pointsXML = track.coordinates
             .map { point in
-                """
-                <trkpt lat="\(point.latitude)" lon="\(point.longitude)"></trkpt>
-                """
+                if let course = point.course {
+                    return """
+                    <trkpt lat="\(point.latitude)" lon="\(point.longitude)">
+                      <extensions><gom:course>\(course)</gom:course></extensions>
+                    </trkpt>
+                    """
+                } else {
+                    return """
+                    <trkpt lat="\(point.latitude)" lon="\(point.longitude)"></trkpt>
+                    """
+                }
             }
             .joined(separator: "\n")
 
         return """
         <?xml version="1.0" encoding="UTF-8"?>
-        <gpx version="1.1" creator="PathyApp" xmlns="http://www.topografix.com/GPX/1/1">
+        <gpx version="1.1" creator="PathyApp" xmlns="http://www.topografix.com/GPX/1/1" xmlns:gom="https://gurumaps.app/xmlschemas/GuruMapsExtensions/v1">
           <trk>
             <name>\(track.name)</name>
             <trkseg>
@@ -73,6 +81,7 @@ private final class GPXParser: NSObject, XMLParserDelegate {
     private var points: [TrackCoordinate] = []
     private var currentLat: Double?
     private var currentLon: Double?
+    private var currentCourse: Double?
     private var currentValue = ""
 
     init(data: Data) {
@@ -94,6 +103,7 @@ private final class GPXParser: NSObject, XMLParserDelegate {
         if name == "trkpt" || name == "rtept" || name == "wpt" {
             currentLat = Double(attributeDict["lat"] ?? "")
             currentLon = Double(attributeDict["lon"] ?? "")
+            currentCourse = nil
         }
     }
 
@@ -102,10 +112,14 @@ private final class GPXParser: NSObject, XMLParserDelegate {
     }
 
     func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
-        switch elementName.lowercased() {
+        let element = (qName ?? elementName).lowercased()
+        switch element {
+        case "course", "gom:course":
+            let value = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            currentCourse = Double(value)
         case "trkpt", "rtept", "wpt":
             guard let lat = currentLat, let lon = currentLon else { return }
-            let point = TrackCoordinate(latitude: lat, longitude: lon)
+            let point = TrackCoordinate(latitude: lat, longitude: lon, course: currentCourse)
             points.append(point)
         default:
             break

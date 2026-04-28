@@ -72,7 +72,8 @@ final class LocationTracker: NSObject, ObservableObject {
         bufferedCoordinates.append(
             TrackCoordinate(
                 latitude: location.coordinate.latitude,
-                longitude: location.coordinate.longitude
+                longitude: location.coordinate.longitude,
+                course: location.course >= 0 ? location.course : nil
             )
         )
 

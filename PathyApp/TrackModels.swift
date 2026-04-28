@@ -43,7 +43,7 @@ final class Track {
         }
         return points
             .sorted(by: { $0.timestamp < $1.timestamp })
-            .map { TrackCoordinate(latitude: $0.latitude, longitude: $0.longitude) }
+            .map { TrackCoordinate(latitude: $0.latitude, longitude: $0.longitude, course: $0.course) }
     }
 
     func replaceCoordinates(_ coordinates: [TrackCoordinate]) {
@@ -80,34 +80,41 @@ final class Track {
 struct TrackCoordinate: Sendable, Hashable, Codable {
     let latitude: Double
     let longitude: Double
+    let course: Double?
 }
 
 enum TrackGeometryCodec {
-    private static let version: UInt8 = 1
+    private static let version1: UInt8 = 1
+    private static let version2: UInt8 = 2
 
     static func encode(_ coordinates: [TrackCoordinate]) -> Data {
         var data = Data()
-        data.reserveCapacity(1 + 4 + coordinates.count * 8)
+        data.reserveCapacity(1 + 4 + coordinates.count * 12)
 
-        data.append(version)
+        data.append(version2)
         var count = UInt32(coordinates.count).littleEndian
         withUnsafeBytes(of: &count) { data.append(contentsOf: $0) }
 
         for coordinate in coordinates {
             var lat = Int32((coordinate.latitude * 10_000_000).rounded()).littleEndian
             var lon = Int32((coordinate.longitude * 10_000_000).rounded()).littleEndian
+            var course = Float((coordinate.course ?? .nan)).bitPattern.littleEndian
             withUnsafeBytes(of: &lat) { data.append(contentsOf: $0) }
             withUnsafeBytes(of: &lon) { data.append(contentsOf: $0) }
+            withUnsafeBytes(of: &course) { data.append(contentsOf: $0) }
         }
         return data
     }
 
     static func decode(_ data: Data) -> [TrackCoordinate] {
         guard data.count >= 5 else { return [] }
-        guard data[0] == version else { return [] }
+
+        let version = data[0]
+        guard version == version1 || version == version2 else { return [] }
 
         let expectedCount = Int(readUInt32(from: data, offset: 1))
-        let payloadLength = expectedCount * 8
+        let stride = version == version2 ? 12 : 8
+        let payloadLength = expectedCount * stride
         guard data.count >= 5 + payloadLength else { return [] }
 
         var coordinates: [TrackCoordinate] = []
@@ -117,8 +124,16 @@ enum TrackGeometryCodec {
         for _ in 0..<expectedCount {
             let lat = Double(readInt32(from: data, offset: cursor)) / 10_000_000
             let lon = Double(readInt32(from: data, offset: cursor + 4)) / 10_000_000
-            coordinates.append(TrackCoordinate(latitude: lat, longitude: lon))
-            cursor += 8
+            if version == version2 {
+                let rawCourse = readUInt32(from: data, offset: cursor + 8)
+                let course = Double(Float(bitPattern: rawCourse.littleEndian))
+                let normalizedCourse = course.isFinite ? course : nil
+                coordinates.append(TrackCoordinate(latitude: lat, longitude: lon, course: normalizedCourse))
+                cursor += 12
+            } else {
+                coordinates.append(TrackCoordinate(latitude: lat, longitude: lon, course: nil))
+                cursor += 8
+            }
         }
         return coordinates
     }
