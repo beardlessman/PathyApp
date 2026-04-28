@@ -19,6 +19,12 @@ final class LocationTracker: NSObject, ObservableObject {
     private var deferredDistance: CLLocationDistance = 120
     private var deferredTimeout: TimeInterval = 120
     private var bufferedCoordinates: [TrackCoordinate] = []
+    private var lastSignificantLocation: CLLocation?
+    private var lastSignificantMovementAt: Date?
+
+    private let significantMovementThreshold: CLLocationDistance = 20
+    private let stationaryTimeout: TimeInterval = 30 * 60
+    private let activeTrackIDKey = "activeTrackingTrackID"
 
     override init() {
         super.init()
@@ -32,6 +38,7 @@ final class LocationTracker: NSObject, ObservableObject {
 
     func attach(modelContext: ModelContext) {
         self.modelContext = modelContext
+        restoreActiveTrackingIfNeeded()
     }
 
     func requestPermissions() {
@@ -52,6 +59,9 @@ final class LocationTracker: NSObject, ObservableObject {
         modelContext.insert(track)
         currentTrack = track
         bufferedCoordinates = track.coordinates
+        lastSignificantLocation = nil
+        lastSignificantMovementAt = .now
+        persistActiveTrackID(track.id)
         isTracking = true
         locationManager.startUpdatingLocation()
     }
@@ -62,6 +72,7 @@ final class LocationTracker: NSObject, ObservableObject {
         flushCoordinates(forceSave: true)
         currentTrack?.finishedAt = .now
         isTracking = false
+        clearActiveTrackID()
         try? modelContext?.save()
     }
 
@@ -76,6 +87,8 @@ final class LocationTracker: NSObject, ObservableObject {
                 course: location.course >= 0 ? location.course : nil
             )
         )
+
+        evaluateMovementState(with: location)
 
         if bufferedCoordinates.count.isMultiple(of: 25) {
             flushCoordinates()
@@ -106,6 +119,67 @@ final class LocationTracker: NSObject, ObservableObject {
         if forceSave || bufferedCoordinates.count.isMultiple(of: 25) {
             try? modelContext.save()
         }
+    }
+
+    private func evaluateMovementState(with location: CLLocation) {
+        if lastSignificantLocation == nil {
+            lastSignificantLocation = location
+            lastSignificantMovementAt = location.timestamp
+            return
+        }
+
+        guard let lastSignificantLocation, let lastSignificantMovementAt else { return }
+        let distance = location.distance(from: lastSignificantLocation)
+
+        if distance >= significantMovementThreshold {
+            self.lastSignificantLocation = location
+            self.lastSignificantMovementAt = location.timestamp
+            return
+        }
+
+        if location.timestamp.timeIntervalSince(lastSignificantMovementAt) >= stationaryTimeout {
+            stopTracking()
+        }
+    }
+
+    private func restoreActiveTrackingIfNeeded() {
+        guard let modelContext, !isTracking else { return }
+        guard let idString = UserDefaults.standard.string(forKey: activeTrackIDKey),
+              let trackID = UUID(uuidString: idString) else {
+            return
+        }
+
+        let descriptor = FetchDescriptor<Track>(
+            predicate: #Predicate<Track> { track in
+                track.id == trackID
+            }
+        )
+        guard let track = try? modelContext.fetch(descriptor).first else {
+            clearActiveTrackID()
+            return
+        }
+
+        if track.finishedAt != nil {
+            clearActiveTrackID()
+            return
+        }
+
+        currentTrack = track
+        bufferedCoordinates = track.coordinates
+        lastSignificantLocation = bufferedCoordinates.last.map {
+            CLLocation(latitude: $0.latitude, longitude: $0.longitude)
+        }
+        lastSignificantMovementAt = .now
+        isTracking = true
+        locationManager.startUpdatingLocation()
+    }
+
+    private func persistActiveTrackID(_ id: UUID) {
+        UserDefaults.standard.set(id.uuidString, forKey: activeTrackIDKey)
+    }
+
+    private func clearActiveTrackID() {
+        UserDefaults.standard.removeObject(forKey: activeTrackIDKey)
     }
 }
 
