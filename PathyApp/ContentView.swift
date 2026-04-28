@@ -14,7 +14,7 @@ import UIKit
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
-    @StateObject private var tracker = LocationTracker()
+    @StateObject private var tracker = LocationTracker.shared
     @State private var tracks: [Track] = []
 
     @State private var selectedTrackIDs: Set<UUID> = []
@@ -249,9 +249,7 @@ struct ContentView: View {
         let descriptor = FetchDescriptor<Track>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
         do {
             let fetched = try modelContext.fetch(descriptor)
-            if !fetched.isEmpty {
-                tracks = fetched
-            }
+            tracks = fetched
         } catch {
             tracks = []
             exportError = "Unable to load tracks: \(error.localizedDescription)"

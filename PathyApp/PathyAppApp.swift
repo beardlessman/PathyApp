@@ -10,6 +10,8 @@ import SwiftData
 
 @main
 struct PathyAppApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     var body: some Scene {
         WindowGroup {
             ContentView()
