@@ -3,7 +3,6 @@
 //  PathyApp
 //
 
-import CoreLocation
 import Foundation
 import SwiftData
 
@@ -20,9 +19,6 @@ final class Track {
     var minLongitude: Double
     var maxLongitude: Double
 
-    // Legacy relation kept for compatibility with older local data.
-    @Relationship(deleteRule: .cascade, inverse: \TrackPoint.track) var points: [TrackPoint]
-
     init(name: String = "New Track", startedAt: Date = .now) {
         self.id = UUID()
         self.startedAt = startedAt
@@ -34,16 +30,10 @@ final class Track {
         self.maxLatitude = 0
         self.minLongitude = 0
         self.maxLongitude = 0
-        self.points = []
     }
 
     var coordinates: [TrackCoordinate] {
-        if !geometryData.isEmpty {
-            return TrackGeometryCodec.decode(geometryData)
-        }
-        return points
-            .sorted(by: { $0.timestamp < $1.timestamp })
-            .map { TrackCoordinate(latitude: $0.latitude, longitude: $0.longitude, course: $0.course) }
+        TrackGeometryCodec.decode(geometryData)
     }
 
     func replaceCoordinates(_ coordinates: [TrackCoordinate]) {
@@ -152,48 +142,5 @@ enum TrackGeometryCodec {
             data.copyBytes(to: buffer, from: offset..<(offset + 4))
         }
         return Int32(littleEndian: value)
-    }
-}
-
-@Model
-final class TrackPoint {
-    var timestamp: Date
-    var latitude: Double
-    var longitude: Double
-    var altitude: Double
-    var horizontalAccuracy: Double
-    var speed: Double
-    var course: Double
-    var track: Track?
-
-    init(
-        timestamp: Date,
-        latitude: Double,
-        longitude: Double,
-        altitude: Double,
-        horizontalAccuracy: Double,
-        speed: Double,
-        course: Double,
-        track: Track?
-    ) {
-        self.timestamp = timestamp
-        self.latitude = latitude
-        self.longitude = longitude
-        self.altitude = altitude
-        self.horizontalAccuracy = horizontalAccuracy
-        self.speed = speed
-        self.course = course
-        self.track = track
-    }
-
-    init(location: CLLocation, track: Track?) {
-        self.timestamp = location.timestamp
-        self.latitude = location.coordinate.latitude
-        self.longitude = location.coordinate.longitude
-        self.altitude = location.altitude
-        self.horizontalAccuracy = location.horizontalAccuracy
-        self.speed = location.speed
-        self.course = location.course
-        self.track = track
     }
 }
