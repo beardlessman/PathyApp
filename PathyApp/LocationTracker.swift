@@ -18,6 +18,7 @@ final class LocationTracker: NSObject, ObservableObject {
     private var modelContext: ModelContext?
     private var deferredDistance: CLLocationDistance = 120
     private var deferredTimeout: TimeInterval = 120
+    private var bufferedCoordinates: [TrackCoordinate] = []
 
     override init() {
         super.init()
@@ -50,6 +51,7 @@ final class LocationTracker: NSObject, ObservableObject {
         let track = Track(name: "Track \(Date.now.formatted(date: .abbreviated, time: .shortened))")
         modelContext.insert(track)
         currentTrack = track
+        bufferedCoordinates = track.coordinates
         isTracking = true
         locationManager.startUpdatingLocation()
     }
@@ -57,6 +59,7 @@ final class LocationTracker: NSObject, ObservableObject {
     func stopTracking() {
         locationManager.stopUpdatingLocation()
         locationManager.disallowDeferredLocationUpdates()
+        flushCoordinates()
         currentTrack?.finishedAt = .now
         isTracking = false
         try? modelContext?.save()
@@ -66,12 +69,15 @@ final class LocationTracker: NSObject, ObservableObject {
         guard let modelContext, let currentTrack else { return }
         guard location.horizontalAccuracy > 0, location.horizontalAccuracy <= 100 else { return }
 
-        let point = TrackPoint(location: location, track: currentTrack)
-        modelContext.insert(point)
-        currentTrack.points.append(point)
+        bufferedCoordinates.append(
+            TrackCoordinate(
+                latitude: location.coordinate.latitude,
+                longitude: location.coordinate.longitude
+            )
+        )
 
-        if currentTrack.points.count.isMultiple(of: 15) {
-            try? modelContext.save()
+        if bufferedCoordinates.count.isMultiple(of: 25) {
+            flushCoordinates()
         }
     }
 
@@ -83,6 +89,12 @@ final class LocationTracker: NSObject, ObservableObject {
     private var supportsBackgroundLocationMode: Bool {
         let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String]
         return modes?.contains("location") == true
+    }
+
+    private func flushCoordinates() {
+        guard let modelContext, let currentTrack else { return }
+        currentTrack.replaceCoordinates(bufferedCoordinates)
+        try? modelContext.save()
     }
 }
 

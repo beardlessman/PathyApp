@@ -9,7 +9,7 @@ import SwiftUI
 import UIKit
 
 struct TrackMapView: UIViewRepresentable {
-    var trackPointGroups: [[TrackPoint]]
+    var trackPointGroups: [[TrackCoordinate]]
     var shouldAutoFocus = false
     var focusSignature = ""
     var onMapReady: ((MKMapView, OfflineTileOverlay) -> Void)?
@@ -35,8 +35,7 @@ struct TrackMapView: UIViewRepresentable {
     func updateUIView(_ mapView: MKMapView, context: Context) {
         let coordinateGroups = trackPointGroups
             .map { group in
-                group.sorted(by: { $0.timestamp < $1.timestamp })
-                    .map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) }
+                group.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) }
             }
             .filter { $0.count > 1 }
 

@@ -13,8 +13,8 @@ import UIKit
 
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
-    @Query(sort: \Track.startedAt, order: .reverse) private var tracks: [Track]
     @StateObject private var tracker = LocationTracker()
+    @State private var tracks: [Track] = []
 
     @State private var selectedTrackIDs: Set<UUID> = []
     @State private var knownTrackIDs: Set<UUID> = []
@@ -30,13 +30,13 @@ struct ContentView: View {
         isImportingTrack || isDeletingTracks
     }
 
-    private var displayedTrackPointGroups: [[TrackPoint]] {
+    private var displayedTrackPointGroups: [[TrackCoordinate]] {
         let selectedTracks = tracks.filter { selectedTrackIDs.contains($0.id) }
         if !selectedTracks.isEmpty {
-            return selectedTracks.map(\.points)
+            return selectedTracks.map(\.coordinates)
         }
         if let currentTrack = tracker.currentTrack {
-            return [currentTrack.points]
+            return [currentTrack.coordinates]
         }
         return []
     }
@@ -66,7 +66,20 @@ struct ContentView: View {
 
                 HStack(spacing: 12) {
                     Button(tracker.isTracking ? "Stop Tracking" : "Start Tracking") {
-                        tracker.isTracking ? tracker.stopTracking() : tracker.startTracking()
+                        if tracker.isTracking {
+                            tracker.stopTracking()
+                            if let currentTrack = tracker.currentTrack {
+                                upsertLocalTrack(currentTrack)
+                                try? TrackBackupService.backup(track: currentTrack)
+                            }
+                            refreshTracks()
+                        } else {
+                            tracker.startTracking()
+                            if let currentTrack = tracker.currentTrack {
+                                upsertLocalTrack(currentTrack)
+                            }
+                        }
+                        syncSelectionWithTracks()
                     }
                     .buttonStyle(.borderedProminent)
 
@@ -95,7 +108,7 @@ struct ContentView: View {
                             HStack {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(track.name).font(.headline)
-                                    Text("Points: \(track.points.count)")
+                                    Text("Points: \(track.pointCount)")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -130,7 +143,7 @@ struct ContentView: View {
                     ShareSheet(items: [exportedURL])
                 }
             }
-            .alert("Export Error", isPresented: Binding(
+            .alert("Operation Error", isPresented: Binding(
                 get: { exportError != nil },
                 set: { if !$0 { exportError = nil } }
             ), actions: {
@@ -141,9 +154,8 @@ struct ContentView: View {
             .onAppear {
                 tracker.attach(modelContext: modelContext)
                 tracker.requestPermissions()
-                syncSelectionWithTracks()
-            }
-            .onChange(of: tracks.map(\.id)) { _, _ in
+                restoreFromBackupsIfNeeded()
+                refreshTracks()
                 syncSelectionWithTracks()
             }
             .overlay {
@@ -202,7 +214,7 @@ struct ContentView: View {
 
     private func importTrack(url: URL) {
         isImportingTrack = true
-        Task {
+        Task { @MainActor in
             let hasScopedAccess = url.startAccessingSecurityScopedResource()
             defer {
                 if hasScopedAccess {
@@ -211,14 +223,12 @@ struct ContentView: View {
             }
 
             do {
-                let trackName = url.deletingPathExtension().lastPathComponent
-                let points = try await Task.detached(priority: .userInitiated) {
-                    let data = try Data(contentsOf: url)
-                    return try GPXService.parseGPX(data: data)
-                }.value
-
-                let track = try GPXService.importParsedPoints(points, trackName: trackName, modelContext: modelContext)
+                let track = try GPXService.import(from: url, modelContext: modelContext)
+                try? TrackBackupService.backup(track: track)
+                upsertLocalTrack(track)
+                refreshTracks()
                 selectedTrackIDs.insert(track.id)
+                syncSelectionWithTracks()
             } catch {
                 exportError = "Unable to import GPX: \(error.localizedDescription)"
             }
@@ -245,22 +255,14 @@ struct ContentView: View {
                 for track in tracksToDelete {
                     selectedTrackIDs.remove(track.id)
                     knownTrackIDs.remove(track.id)
-
-                    // Delete large point sets in chunks and yield,
-                    // so the main thread remains responsive.
-                    let points = track.points
-                    for (index, point) in points.enumerated() {
-                        modelContext.delete(point)
-                        if index.isMultiple(of: 250) {
-                            try modelContext.save()
-                            await Task.yield()
-                        }
-                    }
-
+                    TrackBackupService.removeBackup(trackID: track.id)
                     modelContext.delete(track)
-                    try modelContext.save()
-                    await Task.yield()
                 }
+                try modelContext.save()
+                let deletedIDs = Set(tracksToDelete.map(\.id))
+                tracks.removeAll { deletedIDs.contains($0.id) }
+                refreshTracks()
+                syncSelectionWithTracks()
             } catch {
                 exportError = "Unable to delete track: \(error.localizedDescription)"
             }
@@ -276,6 +278,36 @@ struct ContentView: View {
         selectedTrackIDs.subtract(removedIDs)
         selectedTrackIDs.formUnion(newIDs)
         knownTrackIDs = currentIDs
+    }
+
+    private func refreshTracks() {
+        let descriptor = FetchDescriptor<Track>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
+        do {
+            let fetched = try modelContext.fetch(descriptor)
+            if !fetched.isEmpty {
+                tracks = fetched
+            }
+        } catch {
+            tracks = []
+            exportError = "Unable to load tracks: \(error.localizedDescription)"
+        }
+    }
+
+    private func upsertLocalTrack(_ track: Track) {
+        if let index = tracks.firstIndex(where: { $0.id == track.id }) {
+            tracks[index] = track
+        } else {
+            tracks.insert(track, at: 0)
+        }
+        selectedTrackIDs.insert(track.id)
+    }
+
+    private func restoreFromBackupsIfNeeded() {
+        do {
+            _ = try TrackBackupService.restoreIfNeeded(modelContext: modelContext)
+        } catch {
+            exportError = "Backup restore failed: \(error.localizedDescription)"
+        }
     }
 }
 
