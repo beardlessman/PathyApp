@@ -82,11 +82,6 @@ struct ContentView: View {
                         syncSelectionWithTracks()
                     }
                     .buttonStyle(.borderedProminent)
-
-                    Button("Cache Visible") {
-                        cacheVisibleRegion()
-                    }
-                    .buttonStyle(.bordered)
                 }
 
                 HStack(spacing: 12) {
@@ -154,6 +149,9 @@ struct ContentView: View {
             .onAppear {
                 tracker.attach(modelContext: modelContext)
                 tracker.requestPermissions()
+                tracker.onCoordinateRecorded = { coordinate in
+                    autoCacheAroundTrackingCoordinate(coordinate)
+                }
                 refreshTracks()
                 syncSelectionWithTracks()
             }
@@ -178,45 +176,6 @@ struct ContentView: View {
         }
     }
 
-    private func cacheVisibleRegion() {
-        guard let mapView, let tileOverlay else { return }
-        let region = mapView.region
-        let zoomLevels = 12...16
-        var paths: [MKTileOverlayPath] = []
-
-        for zoom in zoomLevels {
-            let rect = tileRect(for: region, zoomLevel: zoom)
-            for x in rect.minX...rect.maxX {
-                for y in rect.minY...rect.maxY {
-                    paths.append(MKTileOverlayPath(x: x, y: y, z: zoom, contentScaleFactor: UIScreen.main.scale))
-                }
-            }
-        }
-        tileOverlay.prefetch(paths: paths)
-    }
-
-    private func tileRect(for region: MKCoordinateRegion, zoomLevel: Int) -> (minX: Int, maxX: Int, minY: Int, maxY: Int) {
-        func lonToTileX(_ lon: Double, zoom: Int) -> Int {
-            Int(floor((lon + 180.0) / 360.0 * Double(1 << zoom)))
-        }
-        func latToTileY(_ lat: Double, zoom: Int) -> Int {
-            let rad = lat * .pi / 180
-            let value = (1 - log(tan(rad) + 1 / cos(rad)) / .pi) / 2
-            return Int(floor(value * Double(1 << zoom)))
-        }
-
-        let north = region.center.latitude + region.span.latitudeDelta / 2
-        let south = region.center.latitude - region.span.latitudeDelta / 2
-        let east = region.center.longitude + region.span.longitudeDelta / 2
-        let west = region.center.longitude - region.span.longitudeDelta / 2
-
-        let minX = lonToTileX(west, zoom: zoomLevel)
-        let maxX = lonToTileX(east, zoom: zoomLevel)
-        let minY = latToTileY(north, zoom: zoomLevel)
-        let maxY = latToTileY(south, zoom: zoomLevel)
-        return (minX, maxX, minY, maxY)
-    }
-
     private func importTrack(url: URL) {
         isImportingTrack = true
         Task { @MainActor in
@@ -238,6 +197,11 @@ struct ContentView: View {
             }
             isImportingTrack = false
         }
+    }
+
+    private func autoCacheAroundTrackingCoordinate(_ coordinate: CLLocationCoordinate2D) {
+        guard tracker.isTracking else { return }
+        tileOverlay?.prefetchAround(coordinate: coordinate, zoomLevels: 13...16, radius: 1)
     }
 
     private func exportAllTracks() {

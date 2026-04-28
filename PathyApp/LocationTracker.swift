@@ -13,6 +13,7 @@ final class LocationTracker: NSObject, ObservableObject {
     @Published private(set) var isTracking = false
     @Published private(set) var authorizationStatus: CLAuthorizationStatus = .notDetermined
     @Published private(set) var currentTrack: Track?
+    var onCoordinateRecorded: ((CLLocationCoordinate2D) -> Void)?
 
     private let locationManager = CLLocationManager()
     private var modelContext: ModelContext?
@@ -87,6 +88,7 @@ final class LocationTracker: NSObject, ObservableObject {
                 course: location.course >= 0 ? location.course : nil
             )
         )
+        onCoordinateRecorded?(location.coordinate)
 
         evaluateMovementState(with: location)
 
