@@ -34,9 +34,14 @@ struct TrackMapView: UIViewRepresentable {
     }
 
     func updateUIView(_ mapView: MKMapView, context: Context) {
-        if followUserLocation, mapView.userTrackingMode != .follow {
-            mapView.setUserTrackingMode(.follow, animated: true)
+        if followUserLocation {
+            if mapView.userTrackingMode != .follow {
+                mapView.setUserTrackingMode(.follow, animated: true)
+            }
+        } else if mapView.userTrackingMode != .none {
+            mapView.setUserTrackingMode(.none, animated: false)
         }
+
         let coordinateGroups = trackPointGroups
             .map { group in
                 group.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) }

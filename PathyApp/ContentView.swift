@@ -29,6 +29,8 @@ struct ContentView: View {
     @State private var exportError: String?
     @State private var editingTrackID: UUID?
     @State private var editingTrackName = ""
+    @State private var isMapExpanded = false
+    @State private var shouldFollowUserOnMap = true
 
     private var isBusy: Bool {
         isImportingTrack || isDeletingTracks
@@ -57,104 +59,165 @@ struct ContentView: View {
         return "\(ids)#\(totalPoints)"
     }
 
+    /// Map and floating buttons. Expanded mode hides the nav bar and ignores safe-area insets behind the MKMapView.
+    @ViewBuilder
+    private var mapAndControlsSection: some View {
+        ZStack {
+            TrackMapView(
+                trackPointGroups: displayedTrackPointGroups,
+                shouldAutoFocus: !selectedTrackIDs.isEmpty,
+                focusSignature: focusSignature,
+                followUserLocation: tracker.isTracking && shouldFollowUserOnMap
+            ) { map, overlay in
+                mapView = map
+                tileOverlay = overlay
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .clipShape(RoundedRectangle(cornerRadius: isMapExpanded ? 0 : 12))
+            .modifier(ExpandedMapIgnoresSafeArea(isExpanded: isMapExpanded))
+
+            VStack(spacing: 10) {
+                if isMapExpanded {
+                    Button {
+                        shouldFollowUserOnMap = true
+                        centerMapOnUserLocation()
+                    } label: {
+                        Image(systemName: "location.fill")
+                            .frame(width: 42, height: 42)
+                    }
+                }
+
+                if isMapExpanded {
+                    Button {
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) {
+                            isMapExpanded = false
+                        }
+                    } label: {
+                        Image(systemName: "arrow.down.right.and.arrow.up.left")
+                            .frame(width: 42, height: 42)
+                    }
+                } else {
+                    Button {
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) {
+                            isMapExpanded = true
+                        }
+                    } label: {
+                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                            .frame(width: 42, height: 42)
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.primary)
+            .background(Color.white.opacity(0.65), in: RoundedRectangle(cornerRadius: 12))
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+            .padding(14)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Tracking controls and track list — only visible when map is not expanded.
+    @ViewBuilder
+    private var collapsedMapChrome: some View {
+        HStack(spacing: 12) {
+            Button(tracker.isTracking ? "Stop Tracking" : "Start Tracking") {
+                if tracker.isTracking {
+                    tracker.stopTracking()
+                    shouldFollowUserOnMap = true
+                    if let currentTrack = tracker.currentTrack {
+                        upsertLocalTrack(currentTrack)
+                    }
+                    refreshTracks()
+                } else {
+                    tracker.startTracking()
+                    shouldFollowUserOnMap = true
+                    if let currentTrack = tracker.currentTrack {
+                        upsertLocalTrack(currentTrack)
+                    }
+                }
+                syncSelectionWithTracks()
+            }
+            .buttonStyle(.borderedProminent)
+
+            if tracker.isTracking {
+                Button(tracker.isPaused ? "Resume" : "Pause") {
+                    if tracker.isPaused {
+                        tracker.resumeTracking()
+                    } else {
+                        tracker.pauseTracking()
+                    }
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+
+        List {
+            ForEach(tracks) { track in
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        if editingTrackID == track.id {
+                            TextField("Track name", text: $editingTrackName)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.headline)
+                                .onSubmit {
+                                    commitTrackNameEdit(for: track)
+                                }
+                                .onDisappear {
+                                    if editingTrackID == track.id {
+                                        commitTrackNameEdit(for: track)
+                                    }
+                                }
+                        } else {
+                            Text(track.name)
+                                .font(.headline)
+                                .onLongPressGesture(minimumDuration: 0.4) {
+                                    beginTrackNameEdit(for: track)
+                                }
+                        }
+
+                        Text(formatDistance(track.distanceMeters))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if selectedTrackIDs.contains(track.id) {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    }
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    if editingTrackID == track.id {
+                        commitTrackNameEdit(for: track)
+                        return
+                    }
+                    if selectedTrackIDs.contains(track.id) {
+                        selectedTrackIDs.remove(track.id)
+                    } else {
+                        selectedTrackIDs.insert(track.id)
+                    }
+                }
+            }
+            .onDelete(perform: deleteTracks)
+        }
+        .frame(height: 180)
+        .disabled(isBusy)
+    }
+
     var body: some View {
         NavigationStack {
-            VStack(spacing: 12) {
-                TrackMapView(
-                    trackPointGroups: displayedTrackPointGroups,
-                    shouldAutoFocus: !selectedTrackIDs.isEmpty,
-                    focusSignature: focusSignature,
-                    followUserLocation: tracker.isTracking
-                ) { map, overlay in
-                    mapView = map
-                    tileOverlay = overlay
+            VStack(spacing: isMapExpanded ? 0 : 12) {
+                mapAndControlsSection
+                    .frame(maxHeight: .infinity)
+
+                if !isMapExpanded {
+                    collapsedMapChrome
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-
-                HStack(spacing: 12) {
-                    Button(tracker.isTracking ? "Stop Tracking" : "Start Tracking") {
-                        if tracker.isTracking {
-                            tracker.stopTracking()
-                            if let currentTrack = tracker.currentTrack {
-                                upsertLocalTrack(currentTrack)
-                            }
-                            refreshTracks()
-                        } else {
-                            tracker.startTracking()
-                            if let currentTrack = tracker.currentTrack {
-                                upsertLocalTrack(currentTrack)
-                            }
-                        }
-                        syncSelectionWithTracks()
-                    }
-                    .buttonStyle(.borderedProminent)
-
-                    if tracker.isTracking {
-                        Button(tracker.isPaused ? "Resume" : "Pause") {
-                            if tracker.isPaused {
-                                tracker.resumeTracking()
-                            } else {
-                                tracker.pauseTracking()
-                            }
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                }
-
-
-                List {
-                    ForEach(tracks) { track in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 4) {
-                                if editingTrackID == track.id {
-                                    TextField("Track name", text: $editingTrackName)
-                                        .textFieldStyle(.roundedBorder)
-                                        .font(.headline)
-                                        .onSubmit {
-                                            commitTrackNameEdit(for: track)
-                                        }
-                                        .onDisappear {
-                                            if editingTrackID == track.id {
-                                                commitTrackNameEdit(for: track)
-                                            }
-                                        }
-                                } else {
-                                    Text(track.name)
-                                        .font(.headline)
-                                        .onLongPressGesture(minimumDuration: 0.4) {
-                                            beginTrackNameEdit(for: track)
-                                        }
-                                }
-
-                                Text(formatDistance(track.distanceMeters))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            if selectedTrackIDs.contains(track.id) {
-                                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                            }
-                        }
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            if editingTrackID == track.id {
-                                commitTrackNameEdit(for: track)
-                                return
-                            }
-                            if selectedTrackIDs.contains(track.id) {
-                                selectedTrackIDs.remove(track.id)
-                            } else {
-                                selectedTrackIDs.insert(track.id)
-                            }
-                        }
-                    }
-                    .onDelete(perform: deleteTracks)
-                }
-                .frame(height: 180)
-                .disabled(isBusy)
             }
-            .padding()
+            .padding(isMapExpanded ? 0 : 16)
             .navigationTitle("Pathy")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -168,19 +231,20 @@ struct ContentView: View {
 
                 ToolbarItem(placement: .topBarTrailing) {
                     NavigationLink {
-                    SettingsView(
-                        isAutoStartEnabled: tracker.isAutoStartEnabled,
-                        setAutoStartEnabled: { tracker.setAutoStartEnabled($0) },
-                        onImportGPX: { isImporting = true },
-                        onExportGPX: exportAllTracks,
-                        canExportGPX: !tracks.isEmpty,
-                        isBusy: isBusy
-                    )
+                        SettingsView(
+                            isAutoStartEnabled: tracker.isAutoStartEnabled,
+                            setAutoStartEnabled: { tracker.setAutoStartEnabled($0) },
+                            onImportGPX: { isImporting = true },
+                            onExportGPX: exportAllTracks,
+                            canExportGPX: !tracks.isEmpty,
+                            isBusy: isBusy
+                        )
                     } label: {
                         Image(systemName: "gearshape")
                     }
                 }
             }
+            .toolbar(isMapExpanded ? .hidden : .automatic, for: .navigationBar)
             .fileImporter(
                 isPresented: $isImporting,
                 allowedContentTypes: [.xml, .gpx],
@@ -221,6 +285,7 @@ struct ContentView: View {
                     refreshTracks()
                 }
             }
+            .animation(nil, value: isMapExpanded)
             .overlay {
                 if isBusy {
                     ZStack {
@@ -325,6 +390,15 @@ struct ContentView: View {
         selectedTrackIDs.insert(track.id)
     }
 
+    private func centerMapOnUserLocation() {
+        guard let mapView else { return }
+        mapView.setUserTrackingMode(.follow, animated: true)
+
+        if let coordinate = mapView.userLocation.location?.coordinate {
+            mapView.setCenter(coordinate, animated: true)
+        }
+    }
+
     private func formatDistance(_ meters: CLLocationDistance) -> String {
         if meters < 1_000 {
             return "\(Int(meters.rounded())) m"
@@ -355,6 +429,19 @@ struct ContentView: View {
         }
     }
 
+}
+
+private struct ExpandedMapIgnoresSafeArea: ViewModifier {
+    let isExpanded: Bool
+
+    func body(content: Content) -> some View {
+        if isExpanded {
+            content
+                .ignoresSafeArea()
+        } else {
+            content
+        }
+    }
 }
 
 private struct DebugDashboardView: View {
