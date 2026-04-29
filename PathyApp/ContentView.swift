@@ -688,6 +688,9 @@ private struct SettingsView: View {
     let canExportGPX: Bool
     let isBusy: Bool
 
+    @State private var tileCacheByteCount: Int64 = 0
+    @State private var clearTilesConfirmation = false
+
     var body: some View {
         Form {
             Section("Tracking") {
@@ -695,6 +698,17 @@ private struct SettingsView: View {
                     get: { isAutoStartEnabled },
                     set: setAutoStartEnabled
                 ))
+            }
+
+            Section("Map tiles") {
+                LabeledContent("Downloaded offline tiles") {
+                    Text(formatTileCacheBytes(tileCacheByteCount))
+                        .foregroundStyle(.secondary)
+                }
+
+                Button("Delete all cached tiles", role: .destructive) {
+                    clearTilesConfirmation = true
+                }
             }
 
             Section("GPX") {
@@ -706,6 +720,39 @@ private struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
+        .onAppear {
+            refreshTileCacheSize()
+        }
+        .alert("Delete cached map tiles?", isPresented: $clearTilesConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete All", role: .destructive) {
+                try? OfflineTileOverlay.removeAllTilesFromDisk()
+                refreshTileCacheSize()
+            }
+        } message: {
+            Text("Map tiles download again while you browse the map. This does not delete your saved tracks.")
+        }
+    }
+
+    private func refreshTileCacheSize() {
+        tileCacheByteCount = OfflineTileOverlay.totalTileCacheByteCount()
+    }
+
+    private func formatTileCacheBytes(_ bytes: Int64) -> String {
+        guard bytes > 0 else { return "0 B" }
+        let gb = Double(bytes) / (1024 * 1024 * 1024)
+        if gb >= 1 {
+            return String(format: "%.2f GB", gb)
+        }
+        let mb = Double(bytes) / (1024 * 1024)
+        if mb >= 1 {
+            return String(format: "%.2f MB", mb)
+        }
+        let kb = Double(bytes) / 1024
+        if kb >= 1 {
+            return String(format: "%.1f KB", kb)
+        }
+        return "\(bytes) B"
     }
 }
 

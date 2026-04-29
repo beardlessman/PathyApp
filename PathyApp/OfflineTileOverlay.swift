@@ -212,3 +212,43 @@ final class OfflineTileOverlay: MKTileOverlay {
         return Int(floor(value * Double(1 << zoom)))
     }
 }
+
+extension OfflineTileOverlay {
+    /// Same root as tiles written by ``OfflineTileOverlay`` instances (`Library/Caches/tile-cache`).
+    static var tileCacheRootURL: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("tile-cache", isDirectory: true)
+    }
+
+    /// Total bytes of stored `.png` tile files under ``tileCacheRootURL``.
+    static func totalTileCacheByteCount() -> Int64 {
+        let fileManager = FileManager.default
+        let root = tileCacheRootURL
+        guard fileManager.fileExists(atPath: root.path),
+              let enumerator = fileManager.enumerator(
+                  at: root,
+                  includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+                  options: [.skipsHiddenFiles]
+              )
+        else { return 0 }
+
+        var total: Int64 = 0
+        for case let url as URL in enumerator {
+            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true
+            else { continue }
+            total += Int64(values.fileSize ?? 0)
+        }
+        return total
+    }
+
+    /// Removes all downloaded tiles and recreates an empty cache directory.
+    static func removeAllTilesFromDisk() throws {
+        let fileManager = FileManager.default
+        let root = tileCacheRootURL
+        if fileManager.fileExists(atPath: root.path) {
+            try fileManager.removeItem(at: root)
+        }
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+    }
+}
