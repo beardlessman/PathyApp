@@ -5,6 +5,7 @@
 //  Created by Dmitrii Mungalov on 28.04.2026.
 //
 
+import Combine
 import MapKit
 import SwiftData
 import SwiftUI
@@ -157,6 +158,14 @@ struct ContentView: View {
             .navigationTitle("Pathy")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    NavigationLink {
+                        DebugDashboardView(tracker: tracker)
+                    } label: {
+                        Image(systemName: "ladybug")
+                    }
+                }
+
                 ToolbarItem(placement: .topBarTrailing) {
                     NavigationLink {
                     SettingsView(
@@ -346,6 +355,237 @@ struct ContentView: View {
         }
     }
 
+}
+
+private struct DebugDashboardView: View {
+    @ObservedObject var tracker: LocationTracker
+    @State private var batteryLevel: Float = UIDevice.current.batteryLevel
+    @State private var batterySamples: [(date: Date, level: Float)] = []
+    @State private var didCopyLog = false
+
+    private let refreshTimer = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        List {
+            Section("Tracking") {
+                debugRow("isTracking", tracker.isTracking ? "true" : "false")
+                debugRow("isPaused", tracker.isPaused ? "true" : "false")
+                debugRow("live points", "\(tracker.liveTrackCoordinates.count)")
+                debugRow("desiredAccuracy", String(format: "%.0f", tracker.debugDesiredAccuracy))
+                debugRow("distanceFilter", String(format: "%.1f m", tracker.debugDistanceFilter))
+                debugRow("deferred", "\(Int(tracker.debugDeferredDistance))m / \(Int(tracker.debugDeferredTimeout))s")
+            }
+
+            Section("Rest / Geofence") {
+                debugRow("geofence", tracker.debugGeofenceActive ? "active" : "inactive")
+                if let rest = tracker.debugRestCoordinate {
+                    debugRow("rest lat", String(format: "%.6f", rest.latitude))
+                    debugRow("rest lon", String(format: "%.6f", rest.longitude))
+                } else {
+                    debugRow("rest point", "n/a")
+                }
+                if let distance = tracker.debugDistanceToRest {
+                    debugRow("distance to rest", String(format: "%.1f m", distance))
+                }
+            }
+
+            Section("Stationary Timer") {
+                if let last = tracker.debugLastSignificantMovementAt {
+                    debugRow("last movement", DateFormatter.debugTimestamp.string(from: last))
+                } else {
+                    debugRow("last movement", "n/a")
+                }
+                if let left = tracker.debugSecondsUntilAutoStop {
+                    debugRow("until auto-stop", formatDuration(left))
+                } else {
+                    debugRow("until auto-stop", "n/a")
+                }
+            }
+
+            Section("GPS Quality") {
+                if let median = tracker.debugMedianHorizontalAccuracy {
+                    debugRow("median hAcc", String(format: "%.1f m", median))
+                } else {
+                    debugRow("median hAcc", "n/a")
+                }
+                if let share = tracker.debugPoorAccuracyShare {
+                    debugRow("poor fixes (>30m)", String(format: "%.0f%%", share * 100))
+                } else {
+                    debugRow("poor fixes (>30m)", "n/a")
+                }
+            }
+
+            Section("Battery Impact Hints") {
+                debugRow("level", formatBatteryLevel())
+                if let drain = estimatedDrainPerHour() {
+                    debugRow("drain estimate", String(format: "%.1f%%/h", drain))
+                } else {
+                    debugRow("drain estimate", "collecting...")
+                }
+            }
+
+            Section("Motion") {
+                debugRow("activity", tracker.lastMotionSummary)
+            }
+
+            Section("Last Location") {
+                if let snapshot = tracker.lastLocationSnapshot {
+                    debugRow("source", snapshot.source)
+                    debugRow("timestamp", DateFormatter.debugTimestamp.string(from: snapshot.timestamp))
+                    debugRow("lat", String(format: "%.6f", snapshot.latitude))
+                    debugRow("lon", String(format: "%.6f", snapshot.longitude))
+                    debugRow("speed", snapshot.speed >= 0 ? String(format: "%.2f m/s", snapshot.speed) : "n/a")
+                    debugRow("course", snapshot.course >= 0 ? String(format: "%.1f°", snapshot.course) : "n/a")
+                    debugRow("hAccuracy", String(format: "%.1f m", snapshot.horizontalAccuracy))
+                    debugRow("vAccuracy", snapshot.verticalAccuracy >= 0 ? String(format: "%.1f m", snapshot.verticalAccuracy) : "n/a")
+                    debugRow("altitude", String(format: "%.1f m", snapshot.altitude))
+                } else {
+                    Text("No location yet")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Section {
+                if tracker.debugEvents.isEmpty {
+                    Text("No events yet")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(Array(tracker.debugEvents.prefix(20).enumerated()), id: \.offset) { _, event in
+                        Text(event)
+                            .font(.system(.footnote, design: .monospaced))
+                    }
+                }
+            } header: {
+                HStack {
+                    Text("Events Log")
+                    Spacer()
+                    Button("Copy Log") {
+                        UIPasteboard.general.string = buildDebugReport()
+                        didCopyLog = true
+                    }
+                    .font(.caption)
+                }
+            } footer: {
+                if didCopyLog {
+                    Text("Debug log copied to clipboard")
+                }
+            }
+        }
+        .navigationTitle("Debug")
+        .onAppear {
+            UIDevice.current.isBatteryMonitoringEnabled = true
+            refreshBattery()
+            tracker.requestDebugLocationScan()
+        }
+        .onReceive(refreshTimer) { _ in
+            refreshBattery()
+        }
+        .onDisappear {
+            didCopyLog = false
+        }
+    }
+
+    @ViewBuilder
+    private func debugRow(_ key: String, _ value: String) -> some View {
+        HStack {
+            Text(key)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text(value)
+                .multilineTextAlignment(.trailing)
+                .font(.system(.body, design: .monospaced))
+        }
+    }
+
+    private func refreshBattery() {
+        batteryLevel = UIDevice.current.batteryLevel
+        guard batteryLevel >= 0 else { return }
+
+        let now = Date()
+        batterySamples.append((date: now, level: batteryLevel))
+        let cutoff = now.addingTimeInterval(-30 * 60)
+        batterySamples.removeAll { $0.date < cutoff }
+    }
+
+    private func formatBatteryLevel() -> String {
+        guard batteryLevel >= 0 else { return "n/a" }
+        return "\(Int((batteryLevel * 100).rounded()))%"
+    }
+
+    private func estimatedDrainPerHour() -> Double? {
+        guard let first = batterySamples.first, let last = batterySamples.last else { return nil }
+        let dt = last.date.timeIntervalSince(first.date)
+        guard dt >= 5 * 60 else { return nil }
+        let delta = Double(first.level - last.level) * 100
+        return max(0, delta / (dt / 3600))
+    }
+
+
+    private func buildDebugReport() -> String {
+        var lines: [String] = []
+        lines.append("Pathy Debug Report")
+        lines.append("generatedAt: \(DateFormatter.debugTimestamp.string(from: .now))")
+        lines.append("isTracking: \(tracker.isTracking)")
+        lines.append("isPaused: \(tracker.isPaused)")
+        lines.append("livePoints: \(tracker.liveTrackCoordinates.count)")
+        lines.append(String(format: "desiredAccuracy: %.0f", tracker.debugDesiredAccuracy))
+        lines.append(String(format: "distanceFilter: %.1f", tracker.debugDistanceFilter))
+        lines.append("deferred: \(Int(tracker.debugDeferredDistance))m / \(Int(tracker.debugDeferredTimeout))s")
+        lines.append("geofenceActive: \(tracker.debugGeofenceActive)")
+        if let rest = tracker.debugRestCoordinate {
+            lines.append(String(format: "restCoordinate: %.6f, %.6f", rest.latitude, rest.longitude))
+        }
+        if let d = tracker.debugDistanceToRest {
+            lines.append(String(format: "distanceToRest: %.1f", d))
+        }
+        if let left = tracker.debugSecondsUntilAutoStop {
+            lines.append("secondsUntilAutoStop: \(Int(left.rounded()))")
+        }
+        if let median = tracker.debugMedianHorizontalAccuracy {
+            lines.append(String(format: "medianHAcc: %.1f", median))
+        }
+        if let share = tracker.debugPoorAccuracyShare {
+            lines.append(String(format: "poorAccuracyShare: %.2f", share))
+        }
+        lines.append("motion: \(tracker.lastMotionSummary)")
+        lines.append("batteryLevel: \(formatBatteryLevel())")
+        if let drain = estimatedDrainPerHour() {
+            lines.append(String(format: "batteryDrainPerHour: %.1f", drain))
+        }
+
+        if let snapshot = tracker.lastLocationSnapshot {
+            lines.append("lastLocation.source: \(snapshot.source)")
+            lines.append("lastLocation.timestamp: \(DateFormatter.debugTimestamp.string(from: snapshot.timestamp))")
+            lines.append(String(format: "lastLocation.lat: %.6f", snapshot.latitude))
+            lines.append(String(format: "lastLocation.lon: %.6f", snapshot.longitude))
+            lines.append(String(format: "lastLocation.speed: %.2f", snapshot.speed))
+            lines.append(String(format: "lastLocation.course: %.1f", snapshot.course))
+            lines.append(String(format: "lastLocation.hAcc: %.1f", snapshot.horizontalAccuracy))
+            lines.append(String(format: "lastLocation.vAcc: %.1f", snapshot.verticalAccuracy))
+            lines.append(String(format: "lastLocation.alt: %.1f", snapshot.altitude))
+        }
+
+        lines.append("events:")
+        lines.append(contentsOf: tracker.debugEvents.prefix(80))
+        return lines.joined(separator: "\n")
+    }
+
+    private func formatDuration(_ seconds: TimeInterval) -> String {
+        let clamped = Int(max(0, seconds.rounded()))
+        let min = clamped / 60
+        let sec = clamped % 60
+        return String(format: "%02dm %02ds", min, sec)
+    }
+}
+
+private extension DateFormatter {
+    static let debugTimestamp: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = .autoupdatingCurrent
+        f.dateStyle = .short
+        f.timeStyle = .medium
+        return f
+    }()
 }
 
 private struct SettingsView: View {
