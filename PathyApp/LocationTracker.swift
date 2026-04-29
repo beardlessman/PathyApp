@@ -25,8 +25,8 @@ final class LocationTracker: NSObject, ObservableObject {
     private let locationManager = CLLocationManager()
     private let motionActivityManager = CMMotionActivityManager()
     private var modelContext: ModelContext?
-    private var deferredDistance: CLLocationDistance = 120
-    private var deferredTimeout: TimeInterval = 120
+    private var deferredDistance: CLLocationDistance = 40
+    private var deferredTimeout: TimeInterval = 30
     private var bufferedCoordinates: [TrackCoordinate] = []
     private var lastSignificantLocation: CLLocation?
     private var lastSignificantMovementAt: Date?
@@ -36,6 +36,7 @@ final class LocationTracker: NSObject, ObservableObject {
     private var latestMotionActivity: CMMotionActivity?
 
     private let significantMovementThreshold: CLLocationDistance = 20
+    private let maxWalkingAutoStartSpeed: CLLocationSpeed = 2.8
     private let autoStartDistanceThreshold: CLLocationDistance = 200
     private let geofenceRadius: CLLocationDistance = 200
     private let gpsJumpDistanceThreshold: CLLocationDistance = 500
@@ -53,6 +54,7 @@ final class LocationTracker: NSObject, ObservableObject {
     private var lastBearingPoint: CLLocation?
     private var lastHorizontalAccuracy: CLLocationAccuracy?
     private var highAccuracyWorkItem: DispatchWorkItem?
+    private var stationaryCheckTimer: Timer?
     private let activeTrackIDKey = "activeTrackingTrackID"
     private let restLatitudeKey = "restLatitude"
     private let restLongitudeKey = "restLongitude"
@@ -66,7 +68,7 @@ final class LocationTracker: NSObject, ObservableObject {
         locationManager.delegate = self
         locationManager.activityType = .fitness
         locationManager.desiredAccuracy = economyAccuracy
-        locationManager.distanceFilter = 20
+        locationManager.distanceFilter = 8
         locationManager.pausesLocationUpdatesAutomatically = true
         locationManager.allowsBackgroundLocationUpdates = supportsBackgroundLocationMode
 
@@ -119,6 +121,7 @@ final class LocationTracker: NSObject, ObservableObject {
         stopRestGeofenceIfNeeded()
         isTracking = true
         isPaused = false
+        startStationaryTimerIfNeeded()
         locationManager.startUpdatingLocation()
         ensureTrackingNotificationsPermissionIfNeeded()
         postTrackingStateNotification(isStarted: true)
@@ -136,6 +139,7 @@ final class LocationTracker: NSObject, ObservableObject {
         currentTrack?.finishedAt = .now
         isTracking = false
         isPaused = false
+        stopStationaryTimer()
         liveTrackCoordinates = bufferedCoordinates
         clearActiveTrackID()
         persistRestLocationFromCurrentState()
@@ -148,6 +152,7 @@ final class LocationTracker: NSObject, ObservableObject {
         guard isTracking, !isPaused else { return }
 
         isPaused = true
+        stopStationaryTimer()
         cancelHighAccuracyReset()
         applyDesiredAccuracyIfNeeded(economyAccuracy)
         locationManager.stopUpdatingLocation()
@@ -160,6 +165,7 @@ final class LocationTracker: NSObject, ObservableObject {
 
         isPaused = false
         lastSignificantMovementAt = .now
+        startStationaryTimerIfNeeded()
         locationManager.startUpdatingLocation()
     }
 
@@ -234,9 +240,7 @@ final class LocationTracker: NSObject, ObservableObject {
             return
         }
 
-        if location.timestamp.timeIntervalSince(lastSignificantMovementAt) >= stationaryTimeout {
-            stopTracking()
-        }
+        evaluateStationaryTimeout(now: location.timestamp)
     }
 
     private func restoreActiveTrackingIfNeeded() {
@@ -273,6 +277,7 @@ final class LocationTracker: NSObject, ObservableObject {
         applyDesiredAccuracyIfNeeded(economyAccuracy)
         isTracking = true
         isPaused = false
+        startStationaryTimerIfNeeded()
         locationManager.stopMonitoringSignificantLocationChanges()
         stopRestGeofenceIfNeeded()
         locationManager.startUpdatingLocation()
@@ -349,7 +354,7 @@ final class LocationTracker: NSObject, ObservableObject {
         guard isAutoStartEnabled else { return }
         guard !isTracking else { return }
         guard authorizationStatus == .authorizedAlways else { return }
-        guard isLikelyWalkingForAutoStart() else { return }
+        guard isLikelyWalkingForAutoStart(at: location) else { return }
 
         if let lastPassiveTriggerLocation, let lastPassiveTriggerAt {
             let distance = location.distance(from: lastPassiveTriggerLocation)
@@ -374,11 +379,35 @@ final class LocationTracker: NSObject, ObservableObject {
     }
 
     private func attemptPendingAutoStart() {
-        guard pendingAutoStartLocation != nil else { return }
+        guard let pendingLocation = pendingAutoStartLocation else { return }
         guard modelContext != nil else { return }
-        guard isLikelyWalkingForAutoStart() else { return }
+        guard isLikelyWalkingForAutoStart(at: pendingLocation) else { return }
         startTracking()
         pendingAutoStartLocation = nil
+    }
+
+
+    private func startStationaryTimerIfNeeded() {
+        stopStationaryTimer()
+        stationaryCheckTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.evaluateStationaryTimeout(now: .now)
+            }
+        }
+    }
+
+    private func stopStationaryTimer() {
+        stationaryCheckTimer?.invalidate()
+        stationaryCheckTimer = nil
+    }
+
+    private func evaluateStationaryTimeout(now: Date) {
+        guard isTracking, !isPaused else { return }
+        guard let lastSignificantMovementAt else { return }
+
+        if now.timeIntervalSince(lastSignificantMovementAt) >= stationaryTimeout {
+            stopTracking()
+        }
     }
 
     private var supportsBackgroundLocationMode: Bool {
@@ -404,11 +433,26 @@ final class LocationTracker: NSObject, ObservableObject {
         }
     }
 
-    private func isLikelyWalkingForAutoStart() -> Bool {
-        guard CMMotionActivityManager.isActivityAvailable() else { return true }
-        guard let activity = latestMotionActivity else { return false }
-        guard activity.confidence != .low else { return false }
-        return activity.walking || activity.running
+    private func isLikelyWalkingForAutoStart(at location: CLLocation) -> Bool {
+        if !CMMotionActivityManager.isActivityAvailable() {
+            let speed = location.speed
+            return speed >= 0 && speed <= maxWalkingAutoStartSpeed
+        }
+
+        guard let activity = latestMotionActivity else {
+            let speed = location.speed
+            return speed >= 0 && speed <= maxWalkingAutoStartSpeed
+        }
+
+        if activity.automotive || activity.cycling {
+            return false
+        }
+        if activity.walking || activity.running {
+            return activity.confidence != .low
+        }
+
+        let speed = location.speed
+        return speed >= 0.2 && speed <= maxWalkingAutoStartSpeed
     }
 
     private func persistActiveTrackID(_ id: UUID) {

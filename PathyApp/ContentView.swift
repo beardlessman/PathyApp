@@ -62,7 +62,8 @@ struct ContentView: View {
                 TrackMapView(
                     trackPointGroups: displayedTrackPointGroups,
                     shouldAutoFocus: !selectedTrackIDs.isEmpty,
-                    focusSignature: focusSignature
+                    focusSignature: focusSignature,
+                    followUserLocation: tracker.isTracking
                 ) { map, overlay in
                     mapView = map
                     tileOverlay = overlay

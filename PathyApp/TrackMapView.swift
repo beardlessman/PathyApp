@@ -12,6 +12,7 @@ struct TrackMapView: UIViewRepresentable {
     var trackPointGroups: [[TrackCoordinate]]
     var shouldAutoFocus = false
     var focusSignature = ""
+    var followUserLocation = false
     var onMapReady: ((MKMapView, OfflineTileOverlay) -> Void)?
 
     func makeCoordinator() -> Coordinator {
@@ -33,6 +34,9 @@ struct TrackMapView: UIViewRepresentable {
     }
 
     func updateUIView(_ mapView: MKMapView, context: Context) {
+        if followUserLocation, mapView.userTrackingMode != .follow {
+            mapView.setUserTrackingMode(.follow, animated: true)
+        }
         let coordinateGroups = trackPointGroups
             .map { group in
                 group.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) }
