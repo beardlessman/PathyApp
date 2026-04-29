@@ -15,6 +15,7 @@ final class LocationTracker: NSObject, ObservableObject {
 
     @Published private(set) var isTracking = false
     @Published private(set) var isPaused = false
+    @Published private(set) var isAutoStartEnabled = true
     @Published private(set) var authorizationStatus: CLAuthorizationStatus = .notDetermined
     @Published private(set) var currentTrack: Track?
     var onCoordinateRecorded: ((CLLocationCoordinate2D) -> Void)?
@@ -54,6 +55,7 @@ final class LocationTracker: NSObject, ObservableObject {
     private let restTimestampKey = "restTimestamp"
     private let passiveGeofenceIdentifier = "resting-geofence"
     private let didAskTrackingNotificationPermissionKey = "didAskTrackingNotificationPermission"
+    private let autoStartEnabledKey = "autoStartEnabled"
 
     private override init() {
         super.init()
@@ -63,6 +65,12 @@ final class LocationTracker: NSObject, ObservableObject {
         locationManager.distanceFilter = 20
         locationManager.pausesLocationUpdatesAutomatically = true
         locationManager.allowsBackgroundLocationUpdates = supportsBackgroundLocationMode
+
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: autoStartEnabledKey) == nil {
+            defaults.set(true, forKey: autoStartEnabledKey)
+        }
+        isAutoStartEnabled = defaults.bool(forKey: autoStartEnabledKey)
     }
 
     func attach(modelContext: ModelContext) {
@@ -150,6 +158,23 @@ final class LocationTracker: NSObject, ObservableObject {
     func persistCurrentState() {
         flushCoordinates(forceSave: true)
     }
+
+    func setAutoStartEnabled(_ enabled: Bool) {
+        guard isAutoStartEnabled != enabled else { return }
+
+        isAutoStartEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: autoStartEnabledKey)
+
+        if enabled {
+            restorePassiveMonitoringIfNeeded()
+            attemptPendingAutoStart()
+        } else {
+            pendingAutoStartLocation = nil
+            locationManager.stopMonitoringSignificantLocationChanges()
+            stopRestGeofenceIfNeeded()
+        }
+    }
+
 
     private func appendLocation(_ location: CLLocation) {
         guard let modelContext, let currentTrack else { return }
@@ -246,6 +271,7 @@ final class LocationTracker: NSObject, ObservableObject {
     }
 
     private func startPassiveMonitoringIfAuthorized() {
+        guard isAutoStartEnabled else { return }
         guard authorizationStatus == .authorizedAlways else { return }
         locationManager.startMonitoringSignificantLocationChanges()
         restoreRestGeofenceIfPossible()
@@ -307,6 +333,7 @@ final class LocationTracker: NSObject, ObservableObject {
     }
 
     private func evaluatePassiveTrigger(with location: CLLocation) {
+        guard isAutoStartEnabled else { return }
         guard !isTracking else { return }
         guard authorizationStatus == .authorizedAlways else { return }
 

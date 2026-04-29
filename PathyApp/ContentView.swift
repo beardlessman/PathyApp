@@ -95,12 +95,6 @@ struct ContentView: View {
                     }
                 }
 
-                HStack(spacing: 12) {
-                    Button("Import GPX") { isImporting = true }
-                        .disabled(isBusy)
-                    Button("Export GPX") { exportAllTracks() }
-                        .disabled(isBusy || tracks.isEmpty)
-                }
 
                 List {
                     ForEach(tracks) { track in
@@ -132,6 +126,23 @@ struct ContentView: View {
             }
             .padding()
             .navigationTitle("Pathy")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    NavigationLink {
+                    SettingsView(
+                        isAutoStartEnabled: tracker.isAutoStartEnabled,
+                        setAutoStartEnabled: { tracker.setAutoStartEnabled($0) },
+                        onImportGPX: { isImporting = true },
+                        onExportGPX: exportAllTracks,
+                        canExportGPX: !tracks.isEmpty,
+                        isBusy: isBusy
+                    )
+                    } label: {
+                        Image(systemName: "gearshape")
+                    }
+                }
+            }
             .fileImporter(
                 isPresented: $isImporting,
                 allowedContentTypes: [.xml, .gpx],
@@ -276,6 +287,35 @@ struct ContentView: View {
         selectedTrackIDs.insert(track.id)
     }
 
+}
+
+private struct SettingsView: View {
+    let isAutoStartEnabled: Bool
+    let setAutoStartEnabled: (Bool) -> Void
+    let onImportGPX: () -> Void
+    let onExportGPX: () -> Void
+    let canExportGPX: Bool
+    let isBusy: Bool
+
+    var body: some View {
+        Form {
+            Section("Tracking") {
+                Toggle("Auto-start tracking", isOn: Binding(
+                    get: { isAutoStartEnabled },
+                    set: setAutoStartEnabled
+                ))
+            }
+
+            Section("GPX") {
+                Button("Import GPX", action: onImportGPX)
+                    .disabled(isBusy)
+
+                Button("Export GPX", action: onExportGPX)
+                    .disabled(isBusy || !canExportGPX)
+            }
+        }
+        .navigationTitle("Settings")
+    }
 }
 
 private extension UTType {
