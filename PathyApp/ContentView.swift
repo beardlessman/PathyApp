@@ -111,7 +111,7 @@ struct ContentView: View {
                             HStack {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(track.name).font(.headline)
-                                    Text("Points: \(track.pointCount)")
+                                    Text(formatDistance(track.distanceMeters))
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -288,6 +288,13 @@ struct ContentView: View {
             tracks.insert(track, at: 0)
         }
         selectedTrackIDs.insert(track.id)
+    }
+
+    private func formatDistance(_ meters: CLLocationDistance) -> String {
+        if meters < 1_000 {
+            return "\(Int(meters.rounded())) m"
+        }
+        return String(format: "%.2f km", meters / 1_000)
     }
 
 }

@@ -5,6 +5,7 @@
 
 import Foundation
 import SwiftData
+import CoreLocation
 
 @Model
 final class Track {
@@ -71,17 +72,37 @@ struct TrackCoordinate: Sendable, Hashable, Codable {
     let latitude: Double
     let longitude: Double
     let course: Double?
+    let speed: Double?
+    let horizontalAccuracy: Double?
+    let timestamp: Date?
+
+    init(
+        latitude: Double,
+        longitude: Double,
+        course: Double?,
+        speed: Double? = nil,
+        horizontalAccuracy: Double? = nil,
+        timestamp: Date? = nil
+    ) {
+        self.latitude = latitude
+        self.longitude = longitude
+        self.course = course
+        self.speed = speed
+        self.horizontalAccuracy = horizontalAccuracy
+        self.timestamp = timestamp
+    }
 }
 
 enum TrackGeometryCodec {
     private static let version1: UInt8 = 1
     private static let version2: UInt8 = 2
+    private static let version3: UInt8 = 3
 
     static func encode(_ coordinates: [TrackCoordinate]) -> Data {
         var data = Data()
-        data.reserveCapacity(1 + 4 + coordinates.count * 12)
+        data.reserveCapacity(1 + 4 + coordinates.count * 28)
 
-        data.append(version2)
+        data.append(version3)
         var count = UInt32(coordinates.count).littleEndian
         withUnsafeBytes(of: &count) { data.append(contentsOf: $0) }
 
@@ -89,9 +110,15 @@ enum TrackGeometryCodec {
             var lat = Int32((coordinate.latitude * 10_000_000).rounded()).littleEndian
             var lon = Int32((coordinate.longitude * 10_000_000).rounded()).littleEndian
             var course = Float((coordinate.course ?? .nan)).bitPattern.littleEndian
+            var speed = Float((coordinate.speed ?? .nan)).bitPattern.littleEndian
+            var hAcc = Float((coordinate.horizontalAccuracy ?? .nan)).bitPattern.littleEndian
+            var timestamp = coordinate.timestamp?.timeIntervalSince1970.bitPattern.littleEndian ?? Double.nan.bitPattern.littleEndian
             withUnsafeBytes(of: &lat) { data.append(contentsOf: $0) }
             withUnsafeBytes(of: &lon) { data.append(contentsOf: $0) }
             withUnsafeBytes(of: &course) { data.append(contentsOf: $0) }
+            withUnsafeBytes(of: &speed) { data.append(contentsOf: $0) }
+            withUnsafeBytes(of: &hAcc) { data.append(contentsOf: $0) }
+            withUnsafeBytes(of: &timestamp) { data.append(contentsOf: $0) }
         }
         return data
     }
@@ -100,10 +127,15 @@ enum TrackGeometryCodec {
         guard data.count >= 5 else { return [] }
 
         let version = data[0]
-        guard version == version1 || version == version2 else { return [] }
+        guard version == version1 || version == version2 || version == version3 else { return [] }
 
         let expectedCount = Int(readUInt32(from: data, offset: 1))
-        let stride = version == version2 ? 12 : 8
+        let stride: Int
+        switch version {
+        case version3: stride = 28
+        case version2: stride = 12
+        default: stride = 8
+        }
         let payloadLength = expectedCount * stride
         guard data.count >= 5 + payloadLength else { return [] }
 
@@ -114,7 +146,29 @@ enum TrackGeometryCodec {
         for _ in 0..<expectedCount {
             let lat = Double(readInt32(from: data, offset: cursor)) / 10_000_000
             let lon = Double(readInt32(from: data, offset: cursor + 4)) / 10_000_000
-            if version == version2 {
+            if version == version3 {
+                let rawCourse = readUInt32(from: data, offset: cursor + 8)
+                let rawSpeed = readUInt32(from: data, offset: cursor + 12)
+                let rawHAcc = readUInt32(from: data, offset: cursor + 16)
+                let rawTimestamp = readUInt64(from: data, offset: cursor + 20)
+
+                let course = Double(Float(bitPattern: rawCourse.littleEndian))
+                let speed = Double(Float(bitPattern: rawSpeed.littleEndian))
+                let hAcc = Double(Float(bitPattern: rawHAcc.littleEndian))
+                let timestampSeconds = Double(bitPattern: rawTimestamp.littleEndian)
+
+                coordinates.append(
+                    TrackCoordinate(
+                        latitude: lat,
+                        longitude: lon,
+                        course: course.isFinite ? course : nil,
+                        speed: speed.isFinite ? speed : nil,
+                        horizontalAccuracy: hAcc.isFinite ? hAcc : nil,
+                        timestamp: timestampSeconds.isFinite ? Date(timeIntervalSince1970: timestampSeconds) : nil
+                    )
+                )
+                cursor += 28
+            } else if version == version2 {
                 let rawCourse = readUInt32(from: data, offset: cursor + 8)
                 let course = Double(Float(bitPattern: rawCourse.littleEndian))
                 let normalizedCourse = course.isFinite ? course : nil
@@ -142,5 +196,30 @@ enum TrackGeometryCodec {
             data.copyBytes(to: buffer, from: offset..<(offset + 4))
         }
         return Int32(littleEndian: value)
+    }
+
+    private static func readUInt64(from data: Data, offset: Int) -> UInt64 {
+        var value: UInt64 = 0
+        _ = withUnsafeMutableBytes(of: &value) { buffer in
+            data.copyBytes(to: buffer, from: offset..<(offset + 8))
+        }
+        return UInt64(littleEndian: value)
+    }
+}
+
+
+extension Track {
+    var distanceMeters: CLLocationDistance {
+        let points = coordinates
+        guard points.count > 1 else { return 0 }
+
+        var distance: CLLocationDistance = 0
+        var prev = CLLocation(latitude: points[0].latitude, longitude: points[0].longitude)
+        for point in points.dropFirst() {
+            let current = CLLocation(latitude: point.latitude, longitude: point.longitude)
+            distance += current.distance(from: prev)
+            prev = current
+        }
+        return distance
     }
 }

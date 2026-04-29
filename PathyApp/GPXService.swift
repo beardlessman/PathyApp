@@ -66,23 +66,44 @@ enum GPXService {
     private static func buildDocument(track: Track) -> String {
         let pointsXML = track.coordinates
             .map { point in
+                var segments: [String] = []
+
+                if let timestamp = point.timestamp {
+                    segments.append("  <time>\(gpxDateFormatter.string(from: timestamp))</time>")
+                }
+
+                var extensionFields: [String] = []
                 if let course = point.course {
-                    return """
-                    <trkpt lat="\(point.latitude)" lon="\(point.longitude)">
-                      <extensions><gom:course>\(course)</gom:course></extensions>
-                    </trkpt>
-                    """
-                } else {
+                    extensionFields.append("<gom:course>\(course)</gom:course>")
+                }
+                if let speed = point.speed {
+                    extensionFields.append("<pathy:speed>\(speed)</pathy:speed>")
+                }
+                if let hAccuracy = point.horizontalAccuracy {
+                    extensionFields.append("<pathy:hAccuracy>\(hAccuracy)</pathy:hAccuracy>")
+                }
+
+                if !extensionFields.isEmpty {
+                    segments.append("  <extensions>\(extensionFields.joined())</extensions>")
+                }
+
+                if segments.isEmpty {
                     return """
                     <trkpt lat="\(point.latitude)" lon="\(point.longitude)"></trkpt>
                     """
                 }
+
+                return """
+                <trkpt lat="\(point.latitude)" lon="\(point.longitude)">
+                \(segments.joined(separator: "\n"))
+                </trkpt>
+                """
             }
             .joined(separator: "\n")
 
         return """
         <?xml version="1.0" encoding="UTF-8"?>
-        <gpx version="1.1" creator="PathyApp" xmlns="http://www.topografix.com/GPX/1/1" xmlns:gom="https://gurumaps.app/xmlschemas/GuruMapsExtensions/v1">
+        <gpx version="1.1" creator="PathyApp" xmlns="http://www.topografix.com/GPX/1/1" xmlns:gom="https://gurumaps.app/xmlschemas/GuruMapsExtensions/v1" xmlns:pathy="https://pathy.app/xmlschemas/extensions/v1">
           <trk>
             <name>\(track.name)</name>
             <trkseg>
@@ -92,6 +113,12 @@ enum GPXService {
         </gpx>
         """
     }
+
+    private static let gpxDateFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
 }
 
 private enum ZipArchive {
@@ -206,6 +233,9 @@ private final class GPXParser: NSObject, XMLParserDelegate {
     private var currentLat: Double?
     private var currentLon: Double?
     private var currentCourse: Double?
+    private var currentSpeed: Double?
+    private var currentHorizontalAccuracy: Double?
+    private var currentTimestamp: Date?
     private var currentValue = ""
 
     init(data: Data) {
@@ -228,6 +258,9 @@ private final class GPXParser: NSObject, XMLParserDelegate {
             currentLat = Double(attributeDict["lat"] ?? "")
             currentLon = Double(attributeDict["lon"] ?? "")
             currentCourse = nil
+            currentSpeed = nil
+            currentHorizontalAccuracy = nil
+            currentTimestamp = nil
         }
     }
 
@@ -241,12 +274,47 @@ private final class GPXParser: NSObject, XMLParserDelegate {
         case "course", "gom:course":
             let value = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
             currentCourse = Double(value)
+        case "speed", "pathy:speed", "gom:speed":
+            let value = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            currentSpeed = Double(value)
+        case "haccuracy", "horizontalaccuracy", "pathy:haccuracy", "gom:haccuracy":
+            let value = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            currentHorizontalAccuracy = Double(value)
+        case "time":
+            let value = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            currentTimestamp = GPXDateParser.parse(value)
         case "trkpt", "rtept", "wpt":
             guard let lat = currentLat, let lon = currentLon else { return }
-            let point = TrackCoordinate(latitude: lat, longitude: lon, course: currentCourse)
+            let point = TrackCoordinate(
+                latitude: lat,
+                longitude: lon,
+                course: currentCourse,
+                speed: currentSpeed,
+                horizontalAccuracy: currentHorizontalAccuracy,
+                timestamp: currentTimestamp
+            )
             points.append(point)
         default:
             break
         }
+    }
+}
+
+
+private enum GPXDateParser {
+    private static let formatterWithFractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let formatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    static func parse(_ value: String) -> Date? {
+        formatterWithFractional.date(from: value) ?? formatter.date(from: value)
     }
 }

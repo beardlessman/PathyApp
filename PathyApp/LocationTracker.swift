@@ -192,7 +192,10 @@ final class LocationTracker: NSObject, ObservableObject {
             TrackCoordinate(
                 latitude: location.coordinate.latitude,
                 longitude: location.coordinate.longitude,
-                course: location.course >= 0 ? location.course : nil
+                course: location.course >= 0 ? location.course : nil,
+                speed: location.speed >= 0 ? location.speed : nil,
+                horizontalAccuracy: location.horizontalAccuracy,
+                timestamp: location.timestamp
             )
         )
         liveTrackCoordinates = bufferedCoordinates
