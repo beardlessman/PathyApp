@@ -7,12 +7,14 @@ import Combine
 import CoreLocation
 import Foundation
 import SwiftData
+import UserNotifications
 
 @MainActor
 final class LocationTracker: NSObject, ObservableObject {
     static let shared = LocationTracker()
 
     @Published private(set) var isTracking = false
+    @Published private(set) var isPaused = false
     @Published private(set) var authorizationStatus: CLAuthorizationStatus = .notDetermined
     @Published private(set) var currentTrack: Track?
     var onCoordinateRecorded: ((CLLocationCoordinate2D) -> Void)?
@@ -34,18 +36,31 @@ final class LocationTracker: NSObject, ObservableObject {
     private let gpsJumpDistanceThreshold: CLLocationDistance = 500
     private let gpsJumpTimeThreshold: TimeInterval = 10
     private let stationaryTimeout: TimeInterval = 15 * 60
+    private let economyAccuracy = kCLLocationAccuracyNearestTenMeters
+    /// Minimum segment length for Bearing-based turn detection (reduces jitter from coarse fixes).
+    private let bearingTurnMinDistance: CLLocationDistance = 28
+    /// Degrees difference between successive movement vectors → likely fork / sharp bend.
+    private let bearingTurnThresholdDegrees = 28.0
+    /// If horizontal accuracy worsens abruptly, briefly request best fixes again.
+    private let poorAccuracyBurstThreshold = 42.0
+    private let poorAccuracyBurstDelta = 22.0
+    private let highAccuracyDuration: TimeInterval = 90
+    private var lastBearingPoint: CLLocation?
+    private var lastHorizontalAccuracy: CLLocationAccuracy?
+    private var highAccuracyWorkItem: DispatchWorkItem?
     private let activeTrackIDKey = "activeTrackingTrackID"
     private let restLatitudeKey = "restLatitude"
     private let restLongitudeKey = "restLongitude"
     private let restTimestampKey = "restTimestamp"
     private let passiveGeofenceIdentifier = "resting-geofence"
+    private let didAskTrackingNotificationPermissionKey = "didAskTrackingNotificationPermission"
 
     private override init() {
         super.init()
         locationManager.delegate = self
         locationManager.activityType = .fitness
-        locationManager.desiredAccuracy = kCLLocationAccuracyBest
-        locationManager.distanceFilter = 7
+        locationManager.desiredAccuracy = economyAccuracy
+        locationManager.distanceFilter = 20
         locationManager.pausesLocationUpdatesAutomatically = true
         locationManager.allowsBackgroundLocationUpdates = supportsBackgroundLocationMode
     }
@@ -80,23 +95,56 @@ final class LocationTracker: NSObject, ObservableObject {
         bufferedCoordinates = track.coordinates
         lastSignificantLocation = nil
         lastSignificantMovementAt = .now
+        lastBearingPoint = nil
+        lastHorizontalAccuracy = nil
+        cancelHighAccuracyReset()
+        applyDesiredAccuracyIfNeeded(economyAccuracy)
         persistActiveTrackID(track.id)
         locationManager.stopMonitoringSignificantLocationChanges()
         stopRestGeofenceIfNeeded()
         isTracking = true
+        isPaused = false
         locationManager.startUpdatingLocation()
+        ensureTrackingNotificationsPermissionIfNeeded()
+        postTrackingStateNotification(isStarted: true)
     }
 
     func stopTracking() {
+        guard isTracking else { return }
+
+        cancelHighAccuracyReset()
+        lastHorizontalAccuracy = nil
+        locationManager.desiredAccuracy = economyAccuracy
         locationManager.stopUpdatingLocation()
         locationManager.disallowDeferredLocationUpdates()
         flushCoordinates(forceSave: true)
         currentTrack?.finishedAt = .now
         isTracking = false
+        isPaused = false
         clearActiveTrackID()
         persistRestLocationFromCurrentState()
         startPassiveMonitoringIfAuthorized()
         try? modelContext?.save()
+        postTrackingStateNotification(isStarted: false)
+    }
+
+    func pauseTracking() {
+        guard isTracking, !isPaused else { return }
+
+        isPaused = true
+        cancelHighAccuracyReset()
+        applyDesiredAccuracyIfNeeded(economyAccuracy)
+        locationManager.stopUpdatingLocation()
+        locationManager.disallowDeferredLocationUpdates()
+        flushCoordinates(forceSave: true)
+    }
+
+    func resumeTracking() {
+        guard isTracking, isPaused else { return }
+
+        isPaused = false
+        lastSignificantMovementAt = .now
+        locationManager.startUpdatingLocation()
     }
 
     func persistCurrentState() {
@@ -116,11 +164,13 @@ final class LocationTracker: NSObject, ObservableObject {
         )
         onCoordinateRecorded?(location.coordinate)
 
+        evaluateAdaptiveAccuracy(with: location)
         evaluateMovementState(with: location)
 
         if bufferedCoordinates.count.isMultiple(of: 25) {
             flushCoordinates(forceSave: false)
         }
+
     }
 
     private func flushCoordinates(forceSave: Bool) {
@@ -179,7 +229,12 @@ final class LocationTracker: NSObject, ObservableObject {
             CLLocation(latitude: $0.latitude, longitude: $0.longitude)
         }
         lastSignificantMovementAt = .now
+        lastBearingPoint = nil
+        lastHorizontalAccuracy = nil
+        cancelHighAccuracyReset()
+        applyDesiredAccuracyIfNeeded(economyAccuracy)
         isTracking = true
+        isPaused = false
         locationManager.stopMonitoringSignificantLocationChanges()
         stopRestGeofenceIfNeeded()
         locationManager.startUpdatingLocation()
@@ -301,6 +356,126 @@ final class LocationTracker: NSObject, ObservableObject {
     private func clearActiveTrackID() {
         UserDefaults.standard.removeObject(forKey: activeTrackIDKey)
     }
+
+
+    private func ensureTrackingNotificationsPermissionIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: didAskTrackingNotificationPermissionKey) else { return }
+
+        defaults.set(true, forKey: didAskTrackingNotificationPermissionKey)
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    private func postTrackingStateNotification(isStarted: Bool) {
+        guard !isPaused else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = isStarted ? "Трекинг начат" : "Трекинг завершён"
+        content.body = isStarted
+            ? "PathyApp начал записывать ваш маршрут."
+            : "PathyApp остановил запись маршрута."
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: "tracking-state-\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request)
+    }
+    private func applyDesiredAccuracyIfNeeded(_ accuracy: CLLocationAccuracy) {
+        guard abs(locationManager.desiredAccuracy - accuracy) > 0.5 else { return }
+        locationManager.desiredAccuracy = accuracy
+    }
+
+    private func cancelScheduledReturnToEconomy() {
+        highAccuracyWorkItem?.cancel()
+        highAccuracyWorkItem = nil
+    }
+
+    private func cancelHighAccuracyReset() {
+        cancelScheduledReturnToEconomy()
+    }
+
+    private func scheduleReturnToEconomyAccuracy() {
+        cancelScheduledReturnToEconomy()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.applyDesiredAccuracyIfNeeded(self.economyAccuracy)
+            self.highAccuracyWorkItem = nil
+        }
+        highAccuracyWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + highAccuracyDuration, execute: item)
+    }
+
+    private func requestHighAccuracyBurst() {
+        applyDesiredAccuracyIfNeeded(kCLLocationAccuracyBest)
+        scheduleReturnToEconomyAccuracy()
+    }
+
+    /// Prefer course from GPS when valid; otherwise movement vector from spaced samples.
+    private func evaluateAdaptiveAccuracy(with location: CLLocation) {
+        let h = location.horizontalAccuracy
+        if let prev = lastHorizontalAccuracy,
+           h > poorAccuracyBurstThreshold,
+           h - prev >= poorAccuracyBurstDelta {
+            requestHighAccuracyBurst()
+        }
+        lastHorizontalAccuracy = h
+
+        guard location.horizontalAccuracy <= 65 else { return }
+
+        if location.course >= 0, location.speed >= 0.5 {
+            if let last = lastBearingPoint, last.course >= 0, last.speed >= 0.5 {
+                let delta = abs(normalizedDegreesDelta(location.course, last.course))
+                if delta >= bearingTurnThresholdDegrees {
+                    requestHighAccuracyBurst()
+                }
+            }
+            lastBearingPoint = location
+            return
+        }
+
+        guard let anchor = lastBearingPoint ?? lastSignificantLocation else {
+            lastBearingPoint = location
+            return
+        }
+        let distance = location.distance(from: anchor)
+        guard distance >= bearingTurnMinDistance else { return }
+
+        let b1 = anchor.bearing(to: location)
+        if let previous = bufferedCoordinates.dropLast().last {
+            let previousLocation = CLLocation(latitude: previous.latitude, longitude: previous.longitude)
+            let segmentDistance = anchor.distance(from: previousLocation)
+            if segmentDistance >= bearingTurnMinDistance {
+                let b0 = previousLocation.bearing(to: anchor)
+                let delta = abs(normalizedDegreesDelta(b1, b0))
+                if delta >= bearingTurnThresholdDegrees {
+                    requestHighAccuracyBurst()
+                }
+            }
+        }
+        lastBearingPoint = location
+    }
+}
+
+private extension CLLocation {
+    func bearing(to other: CLLocation) -> CLLocationDirection {
+        let lat1 = coordinate.latitude * .pi / 180
+        let lat2 = other.coordinate.latitude * .pi / 180
+        let dLon = (other.coordinate.longitude - coordinate.longitude) * .pi / 180
+        let y = sin(dLon) * cos(lat2)
+        let x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon)
+        let θ = atan2(y, x)
+        return θ * 180 / .pi
+    }
+}
+
+private func normalizedDegreesDelta(_ a: CLLocationDirection, _ b: CLLocationDirection) -> CLLocationDirection {
+    var d = a - b
+    while d > 180 { d -= 360 }
+    while d < -180 { d += 360 }
+    return d
 }
 
 extension LocationTracker: CLLocationManagerDelegate {
@@ -317,6 +492,7 @@ extension LocationTracker: CLLocationManagerDelegate {
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         Task { @MainActor in
             if isTracking {
+                guard !isPaused else { return }
                 locations.forEach(appendLocation)
                 armDeferredUpdates()
             } else if let latest = locations.last {
@@ -338,7 +514,7 @@ extension LocationTracker: CLLocationManagerDelegate {
 
     nonisolated func locationManager(_ manager: CLLocationManager, didFinishDeferredUpdatesWithError error: Error?) {
         Task { @MainActor in
-            if isTracking {
+            if isTracking, !isPaused {
                 armDeferredUpdates()
             }
         }

@@ -82,6 +82,17 @@ struct ContentView: View {
                         syncSelectionWithTracks()
                     }
                     .buttonStyle(.borderedProminent)
+
+                    if tracker.isTracking {
+                        Button(tracker.isPaused ? "Resume" : "Pause") {
+                            if tracker.isPaused {
+                                tracker.resumeTracking()
+                            } else {
+                                tracker.pauseTracking()
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                    }
                 }
 
                 HStack(spacing: 12) {
