@@ -5,6 +5,7 @@
 
 import Combine
 import CoreLocation
+import CoreMotion
 import Foundation
 import SwiftData
 import UserNotifications
@@ -21,6 +22,7 @@ final class LocationTracker: NSObject, ObservableObject {
     var onCoordinateRecorded: ((CLLocationCoordinate2D) -> Void)?
 
     private let locationManager = CLLocationManager()
+    private let motionActivityManager = CMMotionActivityManager()
     private var modelContext: ModelContext?
     private var deferredDistance: CLLocationDistance = 120
     private var deferredTimeout: TimeInterval = 120
@@ -30,6 +32,7 @@ final class LocationTracker: NSObject, ObservableObject {
     private var pendingAutoStartLocation: CLLocation?
     private var lastPassiveTriggerLocation: CLLocation?
     private var lastPassiveTriggerAt: Date?
+    private var latestMotionActivity: CMMotionActivity?
 
     private let significantMovementThreshold: CLLocationDistance = 20
     private let autoStartDistanceThreshold: CLLocationDistance = 200
@@ -71,6 +74,8 @@ final class LocationTracker: NSObject, ObservableObject {
             defaults.set(true, forKey: autoStartEnabledKey)
         }
         isAutoStartEnabled = defaults.bool(forKey: autoStartEnabledKey)
+
+        startMotionActivityUpdatesIfAvailable()
     }
 
     func attach(modelContext: ModelContext) {
@@ -336,6 +341,7 @@ final class LocationTracker: NSObject, ObservableObject {
         guard isAutoStartEnabled else { return }
         guard !isTracking else { return }
         guard authorizationStatus == .authorizedAlways else { return }
+        guard isLikelyWalkingForAutoStart() else { return }
 
         if let lastPassiveTriggerLocation, let lastPassiveTriggerAt {
             let distance = location.distance(from: lastPassiveTriggerLocation)
@@ -362,6 +368,7 @@ final class LocationTracker: NSObject, ObservableObject {
     private func attemptPendingAutoStart() {
         guard pendingAutoStartLocation != nil else { return }
         guard modelContext != nil else { return }
+        guard isLikelyWalkingForAutoStart() else { return }
         startTracking()
         pendingAutoStartLocation = nil
     }
@@ -374,6 +381,26 @@ final class LocationTracker: NSObject, ObservableObject {
     private func armDeferredUpdates() {
         guard CLLocationManager.deferredLocationUpdatesAvailable() else { return }
         locationManager.allowDeferredLocationUpdates(untilTraveled: deferredDistance, timeout: deferredTimeout)
+    }
+
+    private func startMotionActivityUpdatesIfAvailable() {
+        guard CMMotionActivityManager.isActivityAvailable() else { return }
+
+        let queue = OperationQueue()
+        queue.qualityOfService = .utility
+        motionActivityManager.startActivityUpdates(to: queue) { [weak self] activity in
+            guard let activity else { return }
+            Task { @MainActor in
+                self?.latestMotionActivity = activity
+            }
+        }
+    }
+
+    private func isLikelyWalkingForAutoStart() -> Bool {
+        guard CMMotionActivityManager.isActivityAvailable() else { return true }
+        guard let activity = latestMotionActivity else { return false }
+        guard activity.confidence != .low else { return false }
+        return activity.walking || activity.running
     }
 
     private func persistActiveTrackID(_ id: UUID) {
