@@ -19,6 +19,7 @@ final class LocationTracker: NSObject, ObservableObject {
     @Published private(set) var isAutoStartEnabled = true
     @Published private(set) var authorizationStatus: CLAuthorizationStatus = .notDetermined
     @Published private(set) var currentTrack: Track?
+    @Published private(set) var liveTrackCoordinates: [TrackCoordinate] = []
     var onCoordinateRecorded: ((CLLocationCoordinate2D) -> Void)?
 
     private let locationManager = CLLocationManager()
@@ -106,6 +107,7 @@ final class LocationTracker: NSObject, ObservableObject {
         modelContext.insert(track)
         currentTrack = track
         bufferedCoordinates = track.coordinates
+        liveTrackCoordinates = bufferedCoordinates
         lastSignificantLocation = nil
         lastSignificantMovementAt = .now
         lastBearingPoint = nil
@@ -134,6 +136,7 @@ final class LocationTracker: NSObject, ObservableObject {
         currentTrack?.finishedAt = .now
         isTracking = false
         isPaused = false
+        liveTrackCoordinates = bufferedCoordinates
         clearActiveTrackID()
         persistRestLocationFromCurrentState()
         startPassiveMonitoringIfAuthorized()
@@ -192,6 +195,7 @@ final class LocationTracker: NSObject, ObservableObject {
                 course: location.course >= 0 ? location.course : nil
             )
         )
+        liveTrackCoordinates = bufferedCoordinates
         onCoordinateRecorded?(location.coordinate)
 
         evaluateAdaptiveAccuracy(with: location)
@@ -255,6 +259,7 @@ final class LocationTracker: NSObject, ObservableObject {
 
         currentTrack = track
         bufferedCoordinates = track.coordinates
+        liveTrackCoordinates = bufferedCoordinates
         lastSignificantLocation = bufferedCoordinates.last.map {
             CLLocation(latitude: $0.latitude, longitude: $0.longitude)
         }

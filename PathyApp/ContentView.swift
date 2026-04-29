@@ -36,6 +36,9 @@ struct ContentView: View {
         if !selectedTracks.isEmpty {
             return selectedTracks.map(\.coordinates)
         }
+        if tracker.isTracking {
+            return [tracker.liveTrackCoordinates]
+        }
         if let currentTrack = tracker.currentTrack {
             return [currentTrack.coordinates]
         }
