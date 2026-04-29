@@ -123,8 +123,8 @@ struct ContentView: View {
     /// Tracking controls and track list — only visible when map is not expanded.
     @ViewBuilder
     private var collapsedMapChrome: some View {
-        HStack(spacing: 12) {
-            Button(tracker.isTracking ? "Stop Tracking" : "Start Tracking") {
+        HStack(spacing: 16) {
+            Button(tracker.isTracking ? "Stop" : "Start") {
                 if tracker.isTracking {
                     tracker.stopTracking()
                     shouldFollowUserOnMap = true
@@ -142,6 +142,10 @@ struct ContentView: View {
                 syncSelectionWithTracks()
             }
             .buttonStyle(.borderedProminent)
+            .tint(tracker.isTracking ? Color.red : Color.green)
+            .controlSize(.large)
+            .font(.title3.weight(.semibold))
+            .frame(minHeight: 48)
 
             if tracker.isTracking {
                 Button(tracker.isPaused ? "Resume" : "Pause") {
@@ -152,6 +156,9 @@ struct ContentView: View {
                     }
                 }
                 .buttonStyle(.bordered)
+                .controlSize(.large)
+                .font(.title3.weight(.semibold))
+                .frame(minHeight: 48)
             }
         }
 
@@ -174,6 +181,7 @@ struct ContentView: View {
                         } else {
                             Text(track.name)
                                 .font(.headline)
+                                .foregroundStyle(selectedTrackIDs.contains(track.id) ? .primary : .tertiary)
                                 .onLongPressGesture(minimumDuration: 0.4) {
                                     beginTrackNameEdit(for: track)
                                 }
@@ -184,9 +192,6 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    if selectedTrackIDs.contains(track.id) {
-                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                    }
                 }
                 .contentShape(Rectangle())
                 .onTapGesture {
