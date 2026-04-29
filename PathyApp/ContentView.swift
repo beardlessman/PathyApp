@@ -26,6 +26,8 @@ struct ContentView: View {
     @State private var isDeletingTracks = false
     @State private var exportedURL: URL?
     @State private var exportError: String?
+    @State private var editingTrackID: UUID?
+    @State private var editingTrackName = ""
 
     private var isBusy: Bool {
         isImportingTrack || isDeletingTracks
@@ -101,24 +103,47 @@ struct ContentView: View {
 
                 List {
                     ForEach(tracks) { track in
-                        Button {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                if editingTrackID == track.id {
+                                    TextField("Track name", text: $editingTrackName)
+                                        .textFieldStyle(.roundedBorder)
+                                        .font(.headline)
+                                        .onSubmit {
+                                            commitTrackNameEdit(for: track)
+                                        }
+                                        .onDisappear {
+                                            if editingTrackID == track.id {
+                                                commitTrackNameEdit(for: track)
+                                            }
+                                        }
+                                } else {
+                                    Text(track.name)
+                                        .font(.headline)
+                                        .onLongPressGesture(minimumDuration: 0.4) {
+                                            beginTrackNameEdit(for: track)
+                                        }
+                                }
+
+                                Text(formatDistance(track.distanceMeters))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if selectedTrackIDs.contains(track.id) {
+                                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            if editingTrackID == track.id {
+                                commitTrackNameEdit(for: track)
+                                return
+                            }
                             if selectedTrackIDs.contains(track.id) {
                                 selectedTrackIDs.remove(track.id)
                             } else {
                                 selectedTrackIDs.insert(track.id)
-                            }
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(track.name).font(.headline)
-                                    Text(formatDistance(track.distanceMeters))
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                if selectedTrackIDs.contains(track.id) {
-                                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                                }
                             }
                         }
                     }
@@ -295,6 +320,29 @@ struct ContentView: View {
             return "\(Int(meters.rounded())) m"
         }
         return String(format: "%.2f km", meters / 1_000)
+    }
+
+
+    private func beginTrackNameEdit(for track: Track) {
+        editingTrackID = track.id
+        editingTrackName = track.name
+    }
+
+    private func commitTrackNameEdit(for track: Track) {
+        guard editingTrackID == track.id else { return }
+
+        let newName = editingTrackName.trimmingCharacters(in: .whitespacesAndNewlines)
+        editingTrackID = nil
+
+        guard !newName.isEmpty, newName != track.name else { return }
+
+        track.name = newName
+        do {
+            try modelContext.save()
+            upsertLocalTrack(track)
+        } catch {
+            exportError = "Unable to rename track: \(error.localizedDescription)"
+        }
     }
 
 }

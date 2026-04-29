@@ -35,13 +35,15 @@ enum GPXService {
 
     static func `import`(from url: URL, modelContext: ModelContext) throws -> Track {
         let data = try Data(contentsOf: url)
-        let points = try parseGPX(data: data)
+        let parsed = try parseGPXDocument(data: data)
+        let points = parsed.points
         guard !points.isEmpty else {
             throw NSError(domain: "GPXImport", code: 2, userInfo: [
                 NSLocalizedDescriptionKey: "No track points found in selected GPX file."
             ])
         }
-        let track = Track(name: url.deletingPathExtension().lastPathComponent, startedAt: .now)
+        let fallbackName = url.deletingPathExtension().lastPathComponent
+        let track = Track(name: parsed.trackName ?? fallbackName, startedAt: .now)
         modelContext.insert(track)
         track.replaceCoordinates(points)
         track.finishedAt = .now
@@ -50,6 +52,10 @@ enum GPXService {
     }
 
     static func parseGPX(data: Data) throws -> [TrackCoordinate] {
+        try parseGPXDocument(data: data).points
+    }
+
+    private static func parseGPXDocument(data: Data) throws -> ParsedGPX {
         let parser = GPXParser(data: data)
         return try parser.parse()
     }
@@ -227,6 +233,11 @@ private extension Data {
     }
 }
 
+private struct ParsedGPX {
+    let trackName: String?
+    let points: [TrackCoordinate]
+}
+
 private final class GPXParser: NSObject, XMLParserDelegate {
     private let parser: XMLParser
     private var points: [TrackCoordinate] = []
@@ -237,6 +248,9 @@ private final class GPXParser: NSObject, XMLParserDelegate {
     private var currentHorizontalAccuracy: Double?
     private var currentTimestamp: Date?
     private var currentValue = ""
+    private var parsedTrackName: String?
+    private var insideTrack = false
+    private var insideRoute = false
 
     init(data: Data) {
         parser = XMLParser(data: data)
@@ -244,16 +258,22 @@ private final class GPXParser: NSObject, XMLParserDelegate {
         parser.delegate = self
     }
 
-    func parse() throws -> [TrackCoordinate] {
+    func parse() throws -> ParsedGPX {
         guard parser.parse() else {
             throw parser.parserError ?? NSError(domain: "GPXParser", code: 1)
         }
-        return points
+        return ParsedGPX(trackName: parsedTrackName, points: points)
     }
 
     func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes attributeDict: [String: String] = [:]) {
         currentValue = ""
         let name = elementName.lowercased()
+        if name == "trk" {
+            insideTrack = true
+        } else if name == "rte" {
+            insideRoute = true
+        }
+
         if name == "trkpt" || name == "rtept" || name == "wpt" {
             currentLat = Double(attributeDict["lat"] ?? "")
             currentLon = Double(attributeDict["lon"] ?? "")
@@ -271,6 +291,13 @@ private final class GPXParser: NSObject, XMLParserDelegate {
     func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
         let element = (qName ?? elementName).lowercased()
         switch element {
+        case "name":
+            if parsedTrackName == nil, insideTrack || insideRoute {
+                let value = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !value.isEmpty {
+                    parsedTrackName = value
+                }
+            }
         case "course", "gom:course":
             let value = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
             currentCourse = Double(value)
@@ -294,6 +321,10 @@ private final class GPXParser: NSObject, XMLParserDelegate {
                 timestamp: currentTimestamp
             )
             points.append(point)
+        case "trk":
+            insideTrack = false
+        case "rte":
+            insideRoute = false
         default:
             break
         }
