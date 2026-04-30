@@ -39,8 +39,9 @@ final class LocationTracker: NSObject, ObservableObject {
     private let locationManager = CLLocationManager()
     private let motionActivityManager = CMMotionActivityManager()
     private var modelContext: ModelContext?
-    private var deferredDistance: CLLocationDistance = 40
-    private var deferredTimeout: TimeInterval = 30
+    /// More granular track recording: ~5x denser than previous 8m/40m/30s defaults.
+    private var deferredDistance: CLLocationDistance = 8
+    private var deferredTimeout: TimeInterval = 6
     private var bufferedCoordinates: [TrackCoordinate] = []
     private var lastSignificantLocation: CLLocation?
     private var lastSignificantMovementAt: Date?
@@ -53,12 +54,12 @@ final class LocationTracker: NSObject, ObservableObject {
 
     private let significantMovementThreshold: CLLocationDistance = 20
     private let maxWalkingAutoStartSpeed: CLLocationSpeed = 2.8
-    private let autoStartDistanceThreshold: CLLocationDistance = 200
+    private let autoStartDistanceThreshold: CLLocationDistance = 50
     private let geofenceRadius: CLLocationDistance = 200
     private let gpsJumpDistanceThreshold: CLLocationDistance = 500
     private let gpsJumpTimeThreshold: TimeInterval = 10
     private let stationaryTimeout: TimeInterval = 15 * 60
-    private let economyAccuracy = kCLLocationAccuracyNearestTenMeters
+    private let economyAccuracy = kCLLocationAccuracyBest
     /// Minimum segment length for Bearing-based turn detection (reduces jitter from coarse fixes).
     private let bearingTurnMinDistance: CLLocationDistance = 28
     /// Degrees difference between successive movement vectors → likely fork / sharp bend.
@@ -67,6 +68,8 @@ final class LocationTracker: NSObject, ObservableObject {
     private let poorAccuracyBurstThreshold = 42.0
     private let poorAccuracyBurstDelta = 22.0
     private let highAccuracyDuration: TimeInterval = 90
+    /// Ignore low-speed GPS drift when deciding whether user actually resumed moving.
+    private let significantMovementMinSpeed: CLLocationSpeed = 0.6
     private var lastBearingPoint: CLLocation?
     private var lastHorizontalAccuracy: CLLocationAccuracy?
     private var highAccuracyWorkItem: DispatchWorkItem?
@@ -84,7 +87,7 @@ final class LocationTracker: NSObject, ObservableObject {
         locationManager.delegate = self
         locationManager.activityType = .fitness
         locationManager.desiredAccuracy = economyAccuracy
-        locationManager.distanceFilter = 8
+        locationManager.distanceFilter = 1.6
         locationManager.pausesLocationUpdatesAutomatically = true
         locationManager.allowsBackgroundLocationUpdates = supportsBackgroundLocationMode
 
@@ -270,8 +273,14 @@ final class LocationTracker: NSObject, ObservableObject {
 
         guard let lastSignificantLocation, let lastSignificantMovementAt else { return }
         let distance = location.distance(from: lastSignificantLocation)
+        let dt = max(1, location.timestamp.timeIntervalSince(lastSignificantMovementAt))
+        let inferredSpeed = distance / dt
+        let adaptiveDistanceThreshold = max(
+            significantMovementThreshold,
+            max(location.horizontalAccuracy, lastSignificantLocation.horizontalAccuracy) * 2
+        )
 
-        if distance >= significantMovementThreshold {
+        if distance >= adaptiveDistanceThreshold && inferredSpeed >= significantMovementMinSpeed {
             self.lastSignificantLocation = location
             self.lastSignificantMovementAt = location.timestamp
             self.debugLastSignificantMovementAt = self.lastSignificantMovementAt

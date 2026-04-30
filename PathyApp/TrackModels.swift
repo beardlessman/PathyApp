@@ -68,6 +68,13 @@ final class Track {
     }
 }
 
+extension Track {
+    /// Approximate on-disk payload per track (geometry blob + name UTF-8). SQLite/SwiftData overhead is extra.
+    var approximateStorageByteCount: Int64 {
+        Int64(geometryData.count + name.utf8.count) + 96
+    }
+}
+
 struct TrackCoordinate: Sendable, Hashable, Codable {
     let latitude: Double
     let longitude: Double

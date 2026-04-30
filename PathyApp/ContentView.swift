@@ -59,6 +59,11 @@ struct ContentView: View {
         return "\(ids)#\(totalPoints)"
     }
 
+    /// Sum of persisted track payloads (blob + metadata estimate); excludes SwiftData bookkeeping.
+    private var approximateSavedTracksTotalBytes: Int64 {
+        tracks.reduce(Int64(0)) { $0 + $1.approximateStorageByteCount }
+    }
+
     /// Map and floating buttons. Expanded mode hides the nav bar and ignores safe-area insets behind the MKMapView.
     @ViewBuilder
     private var mapAndControlsSection: some View {
@@ -242,7 +247,11 @@ struct ContentView: View {
                             onImportGPX: { isImporting = true },
                             onExportGPX: exportAllTracks,
                             canExportGPX: !tracks.isEmpty,
-                            isBusy: isBusy
+                            isBusy: isBusy,
+                            savedTracksApproximateByteCount: approximateSavedTracksTotalBytes,
+                            onDeleteAllTracks: deleteAllTracks,
+                            canBulkDeleteAllTracks: !tracks.isEmpty && !tracker.isTracking,
+                            trackingBlocksBulkDeleteAll: tracker.isTracking && !tracks.isEmpty
                         )
                     } label: {
                         Image(systemName: "gearshape")
@@ -340,6 +349,30 @@ struct ContentView: View {
         } catch {
             exportError = "Unable to export GPX: \(error.localizedDescription)"
         }
+    }
+
+    private func deleteAllTracks() {
+        guard !tracks.isEmpty else { return }
+        isDeletingTracks = true
+        Task { @MainActor in
+            defer { isDeletingTracks = false }
+            do {
+                try deleteAllTracksFromDatabase()
+            } catch {
+                exportError = "Unable to delete tracks: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func deleteAllTracksFromDatabase() throws {
+        let descriptor = FetchDescriptor<Track>()
+        let all = try modelContext.fetch(descriptor)
+        for track in all {
+            modelContext.delete(track)
+        }
+        try modelContext.save()
+        refreshTracks()
+        syncSelectionWithTracks()
     }
 
     private func deleteTracks(at offsets: IndexSet) {
@@ -687,27 +720,51 @@ private struct SettingsView: View {
     let onExportGPX: () -> Void
     let canExportGPX: Bool
     let isBusy: Bool
+    let savedTracksApproximateByteCount: Int64
+    let onDeleteAllTracks: () -> Void
+    let canBulkDeleteAllTracks: Bool
+    let trackingBlocksBulkDeleteAll: Bool
 
     @State private var tileCacheByteCount: Int64 = 0
     @State private var clearTilesConfirmation = false
+    @State private var deleteAllTracksConfirmation = false
 
     var body: some View {
         Form {
             Section("Tracking") {
-                Toggle("Auto-start tracking", isOn: Binding(
+                Toggle("Auto-start", isOn: Binding(
                     get: { isAutoStartEnabled },
                     set: setAutoStartEnabled
                 ))
             }
 
             Section("Map tiles") {
-                LabeledContent("Downloaded offline tiles") {
-                    Text(formatTileCacheBytes(tileCacheByteCount))
+                LabeledContent("Size") {
+                    Text(formatBytes(tileCacheByteCount))
                         .foregroundStyle(.secondary)
                 }
 
-                Button("Delete all cached tiles", role: .destructive) {
+                Button("Delete all", role: .destructive) {
                     clearTilesConfirmation = true
+                }
+            }
+
+            Section {
+                LabeledContent("Size") {
+                    Text(formatBytes(savedTracksApproximateByteCount))
+                        .foregroundStyle(.secondary)
+                }
+
+                Button("Delete all tracks", role: .destructive) {
+                    deleteAllTracksConfirmation = true
+                }
+                .disabled(!canBulkDeleteAllTracks)
+            } header: {
+                Text("Saved tracks")
+            } footer: {
+                if trackingBlocksBulkDeleteAll {
+                    Text("Stop the current recording before deleting all tracks.")
+                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -732,13 +789,24 @@ private struct SettingsView: View {
         } message: {
             Text("Map tiles download again while you browse the map. This does not delete your saved tracks.")
         }
+        .alert("Delete all tracks?", isPresented: $deleteAllTracksConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete All", role: .destructive) {
+                onDeleteAllTracks()
+            }
+        } message: {
+            Text(
+                "All saved tracks will be removed from this device. This cannot be undone. "
+                + "Use Export GPX in the section below first if you want a backup copy."
+            )
+        }
     }
 
     private func refreshTileCacheSize() {
         tileCacheByteCount = OfflineTileOverlay.totalTileCacheByteCount()
     }
 
-    private func formatTileCacheBytes(_ bytes: Int64) -> String {
+    private func formatBytes(_ bytes: Int64) -> String {
         guard bytes > 0 else { return "0 B" }
         let gb = Double(bytes) / (1024 * 1024 * 1024)
         if gb >= 1 {
