@@ -243,6 +243,7 @@ final class LocationTracker: NSObject, ObservableObject {
             updateDebugLocationSnapshot(location, source: "active")
             updateGPSQuality(with: location.horizontalAccuracy)
             evaluateAdaptiveAccuracy(with: location)
+            evaluateMovementState(with: location)
             return
         }
 
@@ -296,7 +297,32 @@ final class LocationTracker: NSObject, ObservableObject {
             return false
         }
 
+        if let lastSignificantLocation, let lastSignificantMovementAt {
+            let distanceFromSignificant = location.distance(from: lastSignificantLocation)
+            let elapsedSinceSignificant = max(1, location.timestamp.timeIntervalSince(lastSignificantMovementAt))
+            let inferredFromSignificant = distanceFromSignificant / elapsedSinceSignificant
+            let adaptiveDriftRadius = max(
+                significantMovementThreshold,
+                max(location.horizontalAccuracy, lastSignificantLocation.horizontalAccuracy) * 2
+            )
+
+            if isLikelyStationaryNow(),
+               inferredFromSignificant < significantMovementMinSpeed,
+               distanceFromSignificant < adaptiveDriftRadius * 1.5 {
+                return false
+            }
+        }
+
         return true
+    }
+
+    private func isLikelyStationaryNow() -> Bool {
+        guard let activity = latestMotionActivity else { return false }
+        guard activity.confidence != .low else { return false }
+        if activity.walking || activity.running || activity.cycling || activity.automotive {
+            return false
+        }
+        return activity.stationary
     }
 
     private func flushCoordinates(forceSave: Bool) {
