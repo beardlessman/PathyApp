@@ -37,12 +37,12 @@ struct ContentView: View {
     }
 
     private var displayedTrackPointGroups: [[TrackCoordinate]] {
+        if tracker.isTracking {
+            return [tracker.liveTrackCoordinates]
+        }
         let selectedTracks = tracks.filter { selectedTrackIDs.contains($0.id) }
         if !selectedTracks.isEmpty {
             return selectedTracks.map(\.coordinates)
-        }
-        if tracker.isTracking {
-            return [tracker.liveTrackCoordinates]
         }
         if let currentTrack = tracker.currentTrack {
             return [currentTrack.coordinates]
@@ -51,12 +51,10 @@ struct ContentView: View {
     }
 
     private var focusSignature: String {
-        let ids = selectedTrackIDs
+        selectedTrackIDs
             .map(\.uuidString)
             .sorted()
             .joined(separator: "|")
-        let totalPoints = displayedTrackPointGroups.reduce(0) { $0 + $1.count }
-        return "\(ids)#\(totalPoints)"
     }
 
     /// Sum of persisted track payloads (blob + metadata estimate); excludes SwiftData bookkeeping.
@@ -70,7 +68,7 @@ struct ContentView: View {
         ZStack {
             TrackMapView(
                 trackPointGroups: displayedTrackPointGroups,
-                shouldAutoFocus: !selectedTrackIDs.isEmpty,
+                shouldAutoFocus: !selectedTrackIDs.isEmpty && !tracker.isTracking,
                 focusSignature: focusSignature,
                 followUserLocation: tracker.isTracking && shouldFollowUserOnMap
             ) { map, overlay in

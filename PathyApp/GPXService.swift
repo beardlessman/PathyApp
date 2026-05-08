@@ -84,37 +84,37 @@ enum GPXService {
 
     private static func buildDocument(track: Track) -> String {
         let pointsXML = track.coordinates
-            .map { point in
-                var segments: [String] = []
+            .map { segment in
+                var pointInnerParts: [String] = []
 
-                if let timestamp = point.timestamp {
-                    segments.append("  <time>\(gpxDateFormatter.string(from: timestamp))</time>")
+                if let timestamp = segment.timestamp {
+                    pointInnerParts.append("  <time>\(gpxDateFormatter.string(from: timestamp))</time>")
                 }
 
                 var extensionFields: [String] = []
-                if let course = point.course {
+                if let course = segment.course {
                     extensionFields.append("<gom:course>\(course)</gom:course>")
                 }
-                if let speed = point.speed {
+                if let speed = segment.speed {
                     extensionFields.append("<pathy:speed>\(speed)</pathy:speed>")
                 }
-                if let hAccuracy = point.horizontalAccuracy {
+                if let hAccuracy = segment.horizontalAccuracy {
                     extensionFields.append("<pathy:hAccuracy>\(hAccuracy)</pathy:hAccuracy>")
                 }
 
                 if !extensionFields.isEmpty {
-                    segments.append("  <extensions>\(extensionFields.joined())</extensions>")
+                    pointInnerParts.append("  <extensions>\(extensionFields.joined())</extensions>")
                 }
 
-                if segments.isEmpty {
+                if pointInnerParts.isEmpty {
                     return """
-                    <trkpt lat="\(point.latitude)" lon="\(point.longitude)"></trkpt>
+                    <trkpt lat="\(segment.latitude)" lon="\(segment.longitude)"></trkpt>
                     """
                 }
 
                 return """
-                <trkpt lat="\(point.latitude)" lon="\(point.longitude)">
-                \(segments.joined(separator: "\n"))
+                <trkpt lat="\(segment.latitude)" lon="\(segment.longitude)">
+                \(pointInnerParts.joined(separator: "\n"))
                 </trkpt>
                 """
             }

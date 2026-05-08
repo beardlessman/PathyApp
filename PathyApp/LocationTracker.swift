@@ -39,7 +39,7 @@ final class LocationTracker: NSObject, ObservableObject {
     private let locationManager = CLLocationManager()
     private let motionActivityManager = CMMotionActivityManager()
     private var modelContext: ModelContext?
-    /// More granular track recording: ~5x denser than previous 8m/40m/30s defaults.
+    /// Deferred batching is disabled during active tracking to keep near-1Hz cadence.
     private var deferredDistance: CLLocationDistance = 8
     private var deferredTimeout: TimeInterval = 6
     private var bufferedCoordinates: [TrackCoordinate] = []
@@ -60,6 +60,9 @@ final class LocationTracker: NSObject, ObservableObject {
     private let gpsJumpTimeThreshold: TimeInterval = 10
     private let stationaryTimeout: TimeInterval = 15 * 60
     private let economyAccuracy = kCLLocationAccuracyBest
+    private let activeTrackingAccuracy = kCLLocationAccuracyBestForNavigation
+    private let economyDistanceFilter: CLLocationDistance = 1.6
+    private let activeTrackingDistanceFilter = kCLDistanceFilterNone
     /// Minimum segment length for Bearing-based turn detection (reduces jitter from coarse fixes).
     private let bearingTurnMinDistance: CLLocationDistance = 28
     /// Degrees difference between successive movement vectors → likely fork / sharp bend.
@@ -70,6 +73,13 @@ final class LocationTracker: NSObject, ObservableObject {
     private let highAccuracyDuration: TimeInterval = 90
     /// Ignore low-speed GPS drift when deciding whether user actually resumed moving.
     private let significantMovementMinSpeed: CLLocationSpeed = 0.6
+    /// Skip near-identical fixes while user is effectively stationary.
+    private let duplicateDistanceThreshold: CLLocationDistance = 3.0
+    private let duplicateTimeThreshold: TimeInterval = 10
+    /// Reject physically implausible jumps that usually come from bad fixes.
+    private let suspiciousJumpDistanceThreshold: CLLocationDistance = 120
+    private let suspiciousJumpSpeedThreshold: CLLocationSpeed = 12
+    private let suspiciousJumpPoorAccuracyThreshold: CLLocationAccuracy = 20
     private var lastBearingPoint: CLLocation?
     private var lastHorizontalAccuracy: CLLocationAccuracy?
     private var highAccuracyWorkItem: DispatchWorkItem?
@@ -86,9 +96,7 @@ final class LocationTracker: NSObject, ObservableObject {
         super.init()
         locationManager.delegate = self
         locationManager.activityType = .fitness
-        locationManager.desiredAccuracy = economyAccuracy
-        locationManager.distanceFilter = 1.6
-        locationManager.pausesLocationUpdatesAutomatically = true
+        applyEconomyLocationConfig()
         locationManager.allowsBackgroundLocationUpdates = supportsBackgroundLocationMode
 
         let defaults = UserDefaults.standard
@@ -138,7 +146,7 @@ final class LocationTracker: NSObject, ObservableObject {
         lastBearingPoint = nil
         lastHorizontalAccuracy = nil
         cancelHighAccuracyReset()
-        applyDesiredAccuracyIfNeeded(economyAccuracy)
+        applyActiveTrackingLocationConfig()
         persistActiveTrackID(track.id)
         locationManager.stopMonitoringSignificantLocationChanges()
         stopRestGeofenceIfNeeded()
@@ -156,7 +164,7 @@ final class LocationTracker: NSObject, ObservableObject {
 
         cancelHighAccuracyReset()
         lastHorizontalAccuracy = nil
-        locationManager.desiredAccuracy = economyAccuracy
+        applyEconomyLocationConfig()
         locationManager.stopUpdatingLocation()
         locationManager.disallowDeferredLocationUpdates()
         flushCoordinates(forceSave: true)
@@ -179,7 +187,7 @@ final class LocationTracker: NSObject, ObservableObject {
         isPaused = true
         stopStationaryTimer()
         cancelHighAccuracyReset()
-        applyDesiredAccuracyIfNeeded(economyAccuracy)
+        applyEconomyLocationConfig()
         locationManager.stopUpdatingLocation()
         locationManager.disallowDeferredLocationUpdates()
         flushCoordinates(forceSave: true)
@@ -193,6 +201,7 @@ final class LocationTracker: NSObject, ObservableObject {
         lastSignificantMovementAt = .now
         debugLastSignificantMovementAt = lastSignificantMovementAt
         updateStationaryDebugFields(now: .now)
+        applyActiveTrackingLocationConfig()
         startStationaryTimerIfNeeded()
         locationManager.startUpdatingLocation()
         logDebugEvent("tracking resumed")
@@ -227,8 +236,15 @@ final class LocationTracker: NSObject, ObservableObject {
 
 
     private func appendLocation(_ location: CLLocation) {
+        guard isTracking, !isPaused else { return }
         guard let modelContext, let currentTrack else { return }
         guard location.horizontalAccuracy > 0, location.horizontalAccuracy <= 100 else { return }
+        guard shouldPersistLocation(location) else {
+            updateDebugLocationSnapshot(location, source: "active")
+            updateGPSQuality(with: location.horizontalAccuracy)
+            evaluateAdaptiveAccuracy(with: location)
+            return
+        }
 
         bufferedCoordinates.append(
             TrackCoordinate(
@@ -252,6 +268,35 @@ final class LocationTracker: NSObject, ObservableObject {
             flushCoordinates(forceSave: false)
         }
 
+    }
+
+    private func shouldPersistLocation(_ location: CLLocation) -> Bool {
+        guard let previousPoint = bufferedCoordinates.last else { return true }
+
+        let previousTimestamp = previousPoint.timestamp ?? location.timestamp
+        let dt = location.timestamp.timeIntervalSince(previousTimestamp)
+        if dt <= 0 { return false }
+
+        let previousLocation = CLLocation(latitude: previousPoint.latitude, longitude: previousPoint.longitude)
+        let distance = location.distance(from: previousLocation)
+
+        let reportedSpeed = location.speed >= 0 ? location.speed : 0
+        if distance <= duplicateDistanceThreshold, dt <= duplicateTimeThreshold, reportedSpeed <= significantMovementMinSpeed {
+            return false
+        }
+
+        if dt <= gpsJumpTimeThreshold, distance >= gpsJumpDistanceThreshold {
+            return false
+        }
+
+        let inferredSpeed = distance / dt
+        if distance >= suspiciousJumpDistanceThreshold,
+           inferredSpeed >= suspiciousJumpSpeedThreshold,
+           location.horizontalAccuracy >= suspiciousJumpPoorAccuracyThreshold {
+            return false
+        }
+
+        return true
     }
 
     private func flushCoordinates(forceSave: Bool) {
@@ -318,13 +363,15 @@ final class LocationTracker: NSObject, ObservableObject {
         lastSignificantLocation = bufferedCoordinates.last.map {
             CLLocation(latitude: $0.latitude, longitude: $0.longitude)
         }
-        lastSignificantMovementAt = .now
+        lastSignificantMovementAt = bufferedCoordinates
+            .compactMap(\.timestamp)
+            .max() ?? .now
         debugLastSignificantMovementAt = lastSignificantMovementAt
-        updateStationaryDebugFields(now: .now)
+        updateStationaryDebugFields(now: lastSignificantMovementAt ?? .now)
         lastBearingPoint = nil
         lastHorizontalAccuracy = nil
         cancelHighAccuracyReset()
-        applyDesiredAccuracyIfNeeded(economyAccuracy)
+        applyActiveTrackingLocationConfig()
         isTracking = true
         isPaused = false
         startStationaryTimerIfNeeded()
@@ -495,6 +542,7 @@ final class LocationTracker: NSObject, ObservableObject {
     }
 
     private func armDeferredUpdates() {
+        guard !isTracking else { return }
         guard CLLocationManager.deferredLocationUpdatesAvailable() else { return }
         locationManager.allowDeferredLocationUpdates(untilTraveled: deferredDistance, timeout: deferredTimeout)
     }
@@ -693,7 +741,11 @@ final class LocationTracker: NSObject, ObservableObject {
         cancelScheduledReturnToEconomy()
         let item = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            self.applyDesiredAccuracyIfNeeded(self.economyAccuracy)
+            if self.isTracking, !self.isPaused {
+                self.applyDesiredAccuracyIfNeeded(self.activeTrackingAccuracy)
+            } else {
+                self.applyDesiredAccuracyIfNeeded(self.economyAccuracy)
+            }
             self.highAccuracyWorkItem = nil
         }
         highAccuracyWorkItem = item
@@ -701,8 +753,21 @@ final class LocationTracker: NSObject, ObservableObject {
     }
 
     private func requestHighAccuracyBurst() {
-        applyDesiredAccuracyIfNeeded(kCLLocationAccuracyBest)
+        guard isTracking else { return }
+        applyDesiredAccuracyIfNeeded(activeTrackingAccuracy)
         scheduleReturnToEconomyAccuracy()
+    }
+
+    private func applyEconomyLocationConfig() {
+        locationManager.pausesLocationUpdatesAutomatically = true
+        locationManager.distanceFilter = economyDistanceFilter
+        applyDesiredAccuracyIfNeeded(economyAccuracy)
+    }
+
+    private func applyActiveTrackingLocationConfig() {
+        locationManager.pausesLocationUpdatesAutomatically = false
+        locationManager.distanceFilter = activeTrackingDistanceFilter
+        applyDesiredAccuracyIfNeeded(activeTrackingAccuracy)
     }
 
     /// Prefer course from GPS when valid; otherwise movement vector from spaced samples.
@@ -794,8 +859,13 @@ extension LocationTracker: CLLocationManagerDelegate {
         Task { @MainActor in
             if isTracking {
                 guard !isPaused else { return }
-                locations.forEach(appendLocation)
-                armDeferredUpdates()
+                for location in locations {
+                    guard isTracking, !isPaused else { break }
+                    appendLocation(location)
+                }
+                if isTracking, !isPaused {
+                    armDeferredUpdates()
+                }
             } else if let latest = locations.last {
                 if pendingDebugLocationScan {
                     updateDebugLocationSnapshot(latest, source: "debug")
