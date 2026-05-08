@@ -16,10 +16,17 @@ enum GPXService {
     }
 
     static func exportAllAsZip(tracks: [Track]) throws -> URL {
-        let sessionID = UUID().uuidString
+        let sortedTracks = tracks.sorted { lhs, rhs in
+            let lhsTime = exportSortDate(for: lhs)
+            let rhsTime = exportSortDate(for: rhs)
+            if lhsTime != rhsTime {
+                return lhsTime < rhsTime
+            }
+            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
         var entries: [ZipArchive.Entry] = []
-        entries.reserveCapacity(tracks.count)
-        for (index, track) in tracks.enumerated() {
+        entries.reserveCapacity(sortedTracks.count)
+        for (index, track) in sortedTracks.enumerated() {
             let safeName = track.name
                 .replacingOccurrences(of: "/", with: "_")
                 .replacingOccurrences(of: " ", with: "_")
@@ -28,9 +35,15 @@ enum GPXService {
             entries.append(.init(filename: filename, data: data))
         }
 
-        let zipURL = FileManager.default.temporaryDirectory.appendingPathComponent("tracks-\(sessionID).zip")
+        let exportTimestamp = zipFilenameDateFormatter.string(from: .now)
+        let zipFilename = "pathy-tracks-\(exportTimestamp).zip"
+        let zipURL = FileManager.default.temporaryDirectory.appendingPathComponent(zipFilename)
         try ZipArchive.create(zipURL: zipURL, entries: entries)
         return zipURL
+    }
+
+    private static func exportSortDate(for track: Track) -> Date {
+        track.coordinates.compactMap(\.timestamp).min() ?? track.startedAt
     }
 
     static func `import`(from url: URL, modelContext: ModelContext) throws -> Track {
@@ -123,6 +136,14 @@ enum GPXService {
     private static let gpxDateFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let zipFilenameDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.timeZone = .autoupdatingCurrent
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm"
         return formatter
     }()
 }
