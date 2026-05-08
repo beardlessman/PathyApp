@@ -9,9 +9,14 @@ import SwiftUI
 import UIKit
 
 struct TrackMapView: UIViewRepresentable {
-    var trackPointGroups: [[TrackCoordinate]]
-    var shouldAutoFocus = false
-    var focusSignature = ""
+    struct Route {
+        let id: String
+        let coordinates: [TrackCoordinate]
+        let strokeColor: UIColor
+    }
+
+    var routes: [Route]
+    var focusedRouteID: String?
     var followUserLocation = false
     var onMapReady: ((MKMapView, OfflineTileOverlay) -> Void)?
 
@@ -42,48 +47,67 @@ struct TrackMapView: UIViewRepresentable {
             mapView.setUserTrackingMode(.none, animated: false)
         }
 
-        let coordinateGroups = trackPointGroups
-            .map { group in
-                group.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) }
+        let drawableRoutes = routes
+            .map { route in
+                (
+                    id: route.id,
+                    color: route.strokeColor,
+                    coordinates: route.coordinates
+                        .map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) }
+                )
             }
-            .filter { $0.count > 1 }
+            .filter { $0.coordinates.count > 1 }
 
-        let tracksSignature = coordinateGroups
-            .map { coordinates in
-                let first = coordinates.first
-                let last = coordinates.last
-                return "\(coordinates.count):\(first?.latitude ?? 0),\(first?.longitude ?? 0):\(last?.latitude ?? 0),\(last?.longitude ?? 0)"
+        let tracksSignature = drawableRoutes
+            .map { route in
+                let first = route.coordinates.first
+                let last = route.coordinates.last
+                let color = route.color.rgbaSignature
+                return "\(route.id):\(route.coordinates.count):\(first?.latitude ?? 0),\(first?.longitude ?? 0):\(last?.latitude ?? 0),\(last?.longitude ?? 0):\(color)"
             }
             .joined(separator: "|")
 
         if context.coordinator.lastTracksSignature != tracksSignature {
             mapView.removeOverlays(context.coordinator.trackPolylines)
-            let polylines = coordinateGroups.map { MKPolyline(coordinates: $0, count: $0.count) }
+            context.coordinator.polylineColors = [:]
+            context.coordinator.polylineRouteIDs = [:]
+            let polylines = drawableRoutes.map { route in
+                let polyline = MKPolyline(coordinates: route.coordinates, count: route.coordinates.count)
+                let polylineID = ObjectIdentifier(polyline)
+                context.coordinator.polylineColors[polylineID] = route.color
+                context.coordinator.polylineRouteIDs[polylineID] = route.id
+                return polyline
+            }
             context.coordinator.trackPolylines = polylines
             mapView.addOverlays(polylines, level: .aboveLabels)
             context.coordinator.lastTracksSignature = tracksSignature
         }
 
-        if shouldAutoFocus, context.coordinator.lastFocusSignature != focusSignature {
-            let unionRect = context.coordinator.trackPolylines
-                .map(\.boundingMapRect)
-                .reduce(MKMapRect.null) { current, next in
-                    current.isNull ? next : current.union(next)
-                }
-
+        if context.coordinator.lastFocusedRouteID != focusedRouteID, let focusedRouteID {
+            let focusedRects = context.coordinator.trackPolylines.compactMap { polyline -> MKMapRect? in
+                let id = context.coordinator.polylineRouteIDs[ObjectIdentifier(polyline)]
+                return id == focusedRouteID ? polyline.boundingMapRect : nil
+            }
+            let unionRect = focusedRects.reduce(MKMapRect.null) { current, next in
+                current.isNull ? next : current.union(next)
+            }
             if !unionRect.isNull {
                 let insets = UIEdgeInsets(top: 48, left: 48, bottom: 48, right: 48)
                 mapView.setVisibleMapRect(unionRect, edgePadding: insets, animated: true)
             }
-            context.coordinator.lastFocusSignature = focusSignature
+            context.coordinator.lastFocusedRouteID = focusedRouteID
+        } else if focusedRouteID == nil {
+            context.coordinator.lastFocusedRouteID = nil
         }
     }
 
     final class Coordinator: NSObject, MKMapViewDelegate {
         var overlay: OfflineTileOverlay?
         var trackPolylines: [MKPolyline] = []
+        var polylineColors: [ObjectIdentifier: UIColor] = [:]
+        var polylineRouteIDs: [ObjectIdentifier: String] = [:]
         var lastTracksSignature = ""
-        var lastFocusSignature = ""
+        var lastFocusedRouteID: String?
 
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let tile = overlay as? MKTileOverlay {
@@ -91,11 +115,22 @@ struct TrackMapView: UIViewRepresentable {
             }
             if let polyline = overlay as? MKPolyline {
                 let renderer = MKPolylineRenderer(polyline: polyline)
-                renderer.strokeColor = .systemBlue
+                renderer.strokeColor = polylineColors[ObjectIdentifier(polyline)] ?? .systemBlue
                 renderer.lineWidth = 4
                 return renderer
             }
             return MKOverlayRenderer(overlay: overlay)
         }
+    }
+}
+
+private extension UIColor {
+    var rgbaSignature: String {
+        var red: CGFloat = 0
+        var green: CGFloat = 0
+        var blue: CGFloat = 0
+        var alpha: CGFloat = 0
+        getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+        return String(format: "%.4f-%.4f-%.4f-%.4f", red, green, blue, alpha)
     }
 }

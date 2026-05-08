@@ -18,7 +18,7 @@ struct ContentView: View {
     @StateObject private var tracker = LocationTracker.shared
     @State private var tracks: [Track] = []
 
-    @State private var selectedTrackIDs: Set<UUID> = []
+    @State private var trackDisplayStates: [UUID: TrackDisplayState] = [:]
     @State private var knownTrackIDs: Set<UUID> = []
     @State private var mapView: MKMapView?
     @State private var tileOverlay: OfflineTileOverlay?
@@ -36,25 +36,30 @@ struct ContentView: View {
         isImportingTrack || isDeletingTracks
     }
 
-    private var displayedTrackPointGroups: [[TrackCoordinate]] {
+    private var displayedTrackRoutes: [TrackMapView.Route] {
         if tracker.isTracking {
-            return [tracker.liveTrackCoordinates]
+            return [
+                .init(
+                    id: "live",
+                    coordinates: tracker.liveTrackCoordinates,
+                    strokeColor: .systemBlue
+                )
+            ]
         }
-        let selectedTracks = tracks.filter { selectedTrackIDs.contains($0.id) }
-        if !selectedTracks.isEmpty {
-            return selectedTracks.map(\.coordinates)
+        return tracks.compactMap { track in
+            let state = trackDisplayStates[track.id] ?? .normal
+            guard state != .hidden else { return nil }
+            return TrackMapView.Route(
+                id: track.id.uuidString,
+                coordinates: track.coordinates,
+                strokeColor: state == .highlighted ? .systemOrange : .systemBlue
+            )
         }
-        if let currentTrack = tracker.currentTrack {
-            return [currentTrack.coordinates]
-        }
-        return []
     }
 
-    private var focusSignature: String {
-        selectedTrackIDs
-            .map(\.uuidString)
-            .sorted()
-            .joined(separator: "|")
+    private var focusedRouteID: String? {
+        guard !tracker.isTracking else { return nil }
+        return tracks.first(where: { (trackDisplayStates[$0.id] ?? .normal) == .highlighted })?.id.uuidString
     }
 
     /// Sum of persisted track payloads (blob + metadata estimate); excludes SwiftData bookkeeping.
@@ -67,9 +72,8 @@ struct ContentView: View {
     private var mapAndControlsSection: some View {
         ZStack {
             TrackMapView(
-                trackPointGroups: displayedTrackPointGroups,
-                shouldAutoFocus: !selectedTrackIDs.isEmpty && !tracker.isTracking,
-                focusSignature: focusSignature,
+                routes: displayedTrackRoutes,
+                focusedRouteID: focusedRouteID,
                 followUserLocation: tracker.isTracking && shouldFollowUserOnMap
             ) { map, overlay in
                 mapView = map
@@ -184,7 +188,10 @@ struct ContentView: View {
                         } else {
                             Text(track.name)
                                 .font(.headline)
-                                .foregroundStyle(selectedTrackIDs.contains(track.id) ? .primary : .tertiary)
+                                .foregroundStyle(nameColor(for: track))
+                                .onTapGesture {
+                                    cycleDisplayState(for: track)
+                                }
                                 .onLongPressGesture(minimumDuration: 0.4) {
                                     beginTrackNameEdit(for: track)
                                 }
@@ -200,12 +207,6 @@ struct ContentView: View {
                 .onTapGesture {
                     if editingTrackID == track.id {
                         commitTrackNameEdit(for: track)
-                        return
-                    }
-                    if selectedTrackIDs.contains(track.id) {
-                        selectedTrackIDs.remove(track.id)
-                    } else {
-                        selectedTrackIDs.insert(track.id)
                     }
                 }
             }
@@ -327,7 +328,6 @@ struct ContentView: View {
                 let track = try GPXService.import(from: url, modelContext: modelContext)
                 upsertLocalTrack(track)
                 refreshTracks()
-                selectedTrackIDs.insert(track.id)
                 syncSelectionWithTracks()
             } catch {
                 exportError = "Unable to import GPX: \(error.localizedDescription)"
@@ -380,7 +380,7 @@ struct ContentView: View {
         Task {
             do {
                 for track in tracksToDelete {
-                    selectedTrackIDs.remove(track.id)
+                    trackDisplayStates.removeValue(forKey: track.id)
                     knownTrackIDs.remove(track.id)
                     modelContext.delete(track)
                 }
@@ -401,8 +401,12 @@ struct ContentView: View {
         let newIDs = currentIDs.subtracting(knownTrackIDs)
         let removedIDs = knownTrackIDs.subtracting(currentIDs)
 
-        selectedTrackIDs.subtract(removedIDs)
-        selectedTrackIDs.formUnion(newIDs)
+        for id in removedIDs {
+            trackDisplayStates.removeValue(forKey: id)
+        }
+        for id in newIDs {
+            trackDisplayStates[id] = .normal
+        }
         knownTrackIDs = currentIDs
     }
 
@@ -423,7 +427,7 @@ struct ContentView: View {
         } else {
             tracks.insert(track, at: 0)
         }
-        selectedTrackIDs.insert(track.id)
+        trackDisplayStates[track.id] = trackDisplayStates[track.id] ?? .normal
     }
 
     private func centerMapOnUserLocation() {
@@ -458,6 +462,23 @@ struct ContentView: View {
         return "\(hours) h \(minutes) min"
     }
 
+    private func nameColor(for track: Track) -> Color {
+        switch trackDisplayStates[track.id] ?? .normal {
+        case .normal:
+            return .primary
+        case .highlighted:
+            return .orange
+        case .hidden:
+            return Color(uiColor: .tertiaryLabel)
+        }
+    }
+
+    private func cycleDisplayState(for track: Track) {
+        let current = trackDisplayStates[track.id] ?? .normal
+        let next = current.next
+        trackDisplayStates[track.id] = next
+    }
+
 
     private func beginTrackNameEdit(for track: Track) {
         editingTrackID = track.id
@@ -481,6 +502,23 @@ struct ContentView: View {
         }
     }
 
+}
+
+private enum TrackDisplayState {
+    case normal
+    case highlighted
+    case hidden
+
+    var next: TrackDisplayState {
+        switch self {
+        case .normal:
+            return .highlighted
+        case .highlighted:
+            return .hidden
+        case .hidden:
+            return .normal
+        }
+    }
 }
 
 private struct ExpandedMapIgnoresSafeArea: ViewModifier {
