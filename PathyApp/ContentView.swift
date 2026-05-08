@@ -62,6 +62,12 @@ struct ContentView: View {
         return tracks.first(where: { (trackDisplayStates[$0.id] ?? .normal) == .highlighted })?.id.uuidString
     }
 
+    private var highlightedTrackCount: Int {
+        tracks.reduce(0) { partialResult, track in
+            partialResult + ((trackDisplayStates[track.id] ?? .normal) == .highlighted ? 1 : 0)
+        }
+    }
+
     /// Sum of persisted track payloads (blob + metadata estimate); excludes SwiftData bookkeeping.
     private var approximateSavedTracksTotalBytes: Int64 {
         tracks.reduce(Int64(0)) { $0 + $1.approximateStorageByteCount }
@@ -214,6 +220,18 @@ struct ContentView: View {
         }
         .frame(height: 180)
         .disabled(isBusy)
+        .overlay(alignment: .topLeading) {
+            if highlightedTrackCount > 1 {
+                Button("Deselect all") {
+                    deselectAllHighlightedTracks()
+                }
+                .font(.footnote)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .padding(.top, 5)
+                .padding(.leading, 12)
+            }
+        }
     }
 
     var body: some View {
@@ -342,8 +360,10 @@ struct ContentView: View {
     }
 
     private func exportAllTracks() {
+        let highlightedTracks = tracks.filter { (trackDisplayStates[$0.id] ?? .normal) == .highlighted }
+        let tracksToExport = highlightedTracks.isEmpty ? tracks : highlightedTracks
         do {
-            exportedURL = try GPXService.exportAllAsZip(tracks: tracks)
+            exportedURL = try GPXService.exportAllAsZip(tracks: tracksToExport)
         } catch {
             exportError = "Unable to export GPX: \(error.localizedDescription)"
         }
@@ -477,6 +497,12 @@ struct ContentView: View {
         let current = trackDisplayStates[track.id] ?? .normal
         let next = current.next
         trackDisplayStates[track.id] = next
+    }
+
+    private func deselectAllHighlightedTracks() {
+        for track in tracks where (trackDisplayStates[track.id] ?? .normal) == .highlighted {
+            trackDisplayStates[track.id] = .normal
+        }
     }
 
 
