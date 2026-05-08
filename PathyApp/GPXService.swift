@@ -20,7 +20,7 @@ enum GPXService {
             let lhsTime = exportSortDate(for: lhs)
             let rhsTime = exportSortDate(for: rhs)
             if lhsTime != rhsTime {
-                return lhsTime < rhsTime
+                return lhsTime > rhsTime
             }
             return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
         }
