@@ -190,7 +190,7 @@ struct ContentView: View {
                                 }
                         }
 
-                        Text(formatDistance(track.distanceMeters))
+                        Text(trackSummary(track))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -440,6 +440,22 @@ struct ContentView: View {
             return "\(Int(meters.rounded())) m"
         }
         return String(format: "%.2f km", meters / 1_000)
+    }
+
+    private func trackSummary(_ track: Track) -> String {
+        let distance = formatDistance(track.distanceMeters)
+        guard let duration = track.duration else { return distance }
+        return "\(distance) • \(formatDuration(duration))"
+    }
+
+    private func formatDuration(_ seconds: TimeInterval) -> String {
+        let totalMinutes = Int((max(0, seconds) / 60).rounded())
+        if totalMinutes < 60 {
+            return "\(totalMinutes) min"
+        }
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+        return "\(hours) h \(minutes) min"
     }
 
 

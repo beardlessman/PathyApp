@@ -229,4 +229,15 @@ extension Track {
         }
         return distance
     }
+
+    var duration: TimeInterval? {
+        let timePoints = coordinates.compactMap(\.timestamp)
+        if let minTime = timePoints.min(), let maxTime = timePoints.max(), maxTime >= minTime {
+            return maxTime.timeIntervalSince(minTime)
+        }
+        if let finishedAt, finishedAt >= startedAt {
+            return finishedAt.timeIntervalSince(startedAt)
+        }
+        return nil
+    }
 }
