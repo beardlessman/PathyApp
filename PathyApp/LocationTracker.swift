@@ -134,7 +134,7 @@ final class LocationTracker: NSObject, ObservableObject {
             return
         }
 
-        let track = Track(name: "Track \(Date.now.formatted(date: .abbreviated, time: .shortened))")
+        let track = Track(name: Date.now.formatted(date: .abbreviated, time: .shortened))
         modelContext.insert(track)
         currentTrack = track
         bufferedCoordinates = track.coordinates
