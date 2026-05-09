@@ -91,6 +91,11 @@ final class LocationTracker: NSObject, ObservableObject {
     private let passiveGeofenceIdentifier = "resting-geofence"
     private let didAskTrackingNotificationPermissionKey = "didAskTrackingNotificationPermission"
     private let autoStartEnabledKey = "autoStartEnabled"
+    /// Persisted alongside active track ID so restore knows whether to suppress automotive fixes.
+    private let activeTrackingSessionAutoStartedKey = "activeTrackingSessionAutoStarted"
+
+    /// True when recording was initiated by passive auto-start (not Start button); used to skip automotive segments.
+    private var currentSessionStartedFromAutoTrigger = false
 
     private override init() {
         super.init()
@@ -127,12 +132,15 @@ final class LocationTracker: NSObject, ObservableObject {
         restorePassiveMonitoringIfNeeded()
     }
 
-    func startTracking() {
+    /// - Parameter startedFromAutoTrigger: `true` when recording began via passive auto-start (`attemptPendingAutoStart`). Manual Start uses `false`.
+    func startTracking(startedFromAutoTrigger: Bool = false) {
         guard let modelContext else { return }
         guard authorizationStatus == .authorizedAlways else {
             locationManager.requestAlwaysAuthorization()
             return
         }
+
+        currentSessionStartedFromAutoTrigger = startedFromAutoTrigger
 
         let track = Track(name: Date.now.formatted(date: .abbreviated, time: .shortened))
         modelContext.insert(track)
@@ -147,7 +155,7 @@ final class LocationTracker: NSObject, ObservableObject {
         lastHorizontalAccuracy = nil
         cancelHighAccuracyReset()
         applyActiveTrackingLocationConfig()
-        persistActiveTrackID(track.id)
+        persistActiveTrackingSession(trackID: track.id, startedFromAutoTrigger: startedFromAutoTrigger)
         locationManager.stopMonitoringSignificantLocationChanges()
         stopRestGeofenceIfNeeded()
         isTracking = true
@@ -161,6 +169,8 @@ final class LocationTracker: NSObject, ObservableObject {
 
     func stopTracking() {
         guard isTracking else { return }
+
+        currentSessionStartedFromAutoTrigger = false
 
         cancelHighAccuracyReset()
         lastHorizontalAccuracy = nil
@@ -272,6 +282,10 @@ final class LocationTracker: NSObject, ObservableObject {
     }
 
     private func shouldPersistLocation(_ location: CLLocation) -> Bool {
+        if suppressNonWalkingPointForAutoTriggeredSession(at: location) {
+            return false
+        }
+
         guard let previousPoint = bufferedCoordinates.last else { return true }
 
         let previousTimestamp = previousPoint.timestamp ?? location.timestamp
@@ -308,6 +322,39 @@ final class LocationTracker: NSObject, ObservableObject {
         }
 
         return true
+    }
+
+    /// Auto-started sessions record only pedestrian walking (`walking` motion / walking-like GPS speed).
+    /// Manual Start is unaffected (`currentSessionStartedFromAutoTrigger == false`).
+    private func suppressNonWalkingPointForAutoTriggeredSession(at location: CLLocation) -> Bool {
+        guard currentSessionStartedFromAutoTrigger else { return false }
+
+        if !CMMotionActivityManager.isActivityAvailable() {
+            return gpsReadsFasterThanWalkingPace(location)
+        }
+
+        guard let activity = latestMotionActivity else {
+            return gpsReadsFasterThanWalkingPace(location)
+        }
+
+        if activity.confidence == .low {
+            return gpsReadsFasterThanWalkingPace(location)
+        }
+
+        if activity.automotive || activity.cycling || activity.running {
+            return true
+        }
+
+        if activity.walking {
+            return false
+        }
+
+        return gpsReadsFasterThanWalkingPace(location)
+    }
+
+    private func gpsReadsFasterThanWalkingPace(_ location: CLLocation) -> Bool {
+        guard location.speed >= 0 else { return false }
+        return location.speed > maxWalkingAutoStartSpeed
     }
 
     private func isLikelyStationaryNow() -> Bool {
@@ -378,6 +425,8 @@ final class LocationTracker: NSObject, ObservableObject {
         }
 
         currentTrack = track
+        currentSessionStartedFromAutoTrigger = UserDefaults.standard.bool(forKey: activeTrackingSessionAutoStartedKey)
+
         bufferedCoordinates = track.coordinates
         liveTrackCoordinates = bufferedCoordinates
         lastSignificantLocation = bufferedCoordinates.last.map {
@@ -526,7 +575,7 @@ final class LocationTracker: NSObject, ObservableObject {
             return
         }
         logDebugEvent("auto-start accepted")
-        startTracking()
+        startTracking(startedFromAutoTrigger: true)
         pendingAutoStartLocation = nil
     }
 
@@ -595,7 +644,10 @@ final class LocationTracker: NSObject, ObservableObject {
         if activity.automotive || activity.cycling {
             return false
         }
-        if activity.walking || activity.running {
+        if activity.running {
+            return false
+        }
+        if activity.walking {
             return activity.confidence != .low
         }
 
@@ -708,12 +760,15 @@ final class LocationTracker: NSObject, ObservableObject {
         return parts.joined(separator: ", ")
     }
 
-    private func persistActiveTrackID(_ id: UUID) {
-        UserDefaults.standard.set(id.uuidString, forKey: activeTrackIDKey)
+    private func persistActiveTrackingSession(trackID: UUID, startedFromAutoTrigger: Bool) {
+        UserDefaults.standard.set(trackID.uuidString, forKey: activeTrackIDKey)
+        UserDefaults.standard.set(startedFromAutoTrigger, forKey: activeTrackingSessionAutoStartedKey)
     }
 
     private func clearActiveTrackID() {
         UserDefaults.standard.removeObject(forKey: activeTrackIDKey)
+        UserDefaults.standard.removeObject(forKey: activeTrackingSessionAutoStartedKey)
+        currentSessionStartedFromAutoTrigger = false
     }
 
 
