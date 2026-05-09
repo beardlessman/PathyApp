@@ -297,18 +297,12 @@ final class LocationTracker: NSObject, ObservableObject {
             return false
         }
 
-        if let lastSignificantLocation, let lastSignificantMovementAt {
-            let distanceFromSignificant = location.distance(from: lastSignificantLocation)
-            let elapsedSinceSignificant = max(1, location.timestamp.timeIntervalSince(lastSignificantMovementAt))
-            let inferredFromSignificant = distanceFromSignificant / elapsedSinceSignificant
-            let adaptiveDriftRadius = max(
-                significantMovementThreshold,
-                max(location.horizontalAccuracy, lastSignificantLocation.horizontalAccuracy) * 2
+        if isLikelyStationaryNow() {
+            let stationaryDriftDistanceThreshold = max(
+                duplicateDistanceThreshold * 2,
+                min(location.horizontalAccuracy * 0.8, 18)
             )
-
-            if isLikelyStationaryNow(),
-               inferredFromSignificant < significantMovementMinSpeed,
-               distanceFromSignificant < adaptiveDriftRadius * 1.5 {
+            if dt <= 20, distance <= stationaryDriftDistanceThreshold {
                 return false
             }
         }
