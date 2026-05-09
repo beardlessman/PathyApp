@@ -122,9 +122,15 @@ final class LocationTracker: NSObject, ObservableObject {
     }
 
     func requestPermissions() {
-        locationManager.requestWhenInUseAuthorization()
-        if authorizationStatus == .authorizedWhenInUse {
+        switch locationManager.authorizationStatus {
+        case .notDetermined:
+            locationManager.requestWhenInUseAuthorization()
+        case .authorizedWhenInUse:
             locationManager.requestAlwaysAuthorization()
+        case .authorizedAlways, .denied, .restricted:
+            break
+        @unknown default:
+            break
         }
     }
 
@@ -923,6 +929,10 @@ extension LocationTracker: CLLocationManagerDelegate {
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         Task { @MainActor in
             authorizationStatus = manager.authorizationStatus
+            if manager.authorizationStatus == .authorizedWhenInUse {
+                // Background recording requires Always authorization.
+                manager.requestAlwaysAuthorization()
+            }
             if manager.authorizationStatus == .authorizedAlways {
                 restorePassiveMonitoringIfNeeded()
                 attemptPendingAutoStart()

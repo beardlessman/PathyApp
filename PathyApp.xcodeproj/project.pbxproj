@@ -256,6 +256,7 @@
 				DEVELOPMENT_TEAM = Q7YH32RCVW;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSLocationAlwaysUsageDescription = "Pathy records your routes in background, even when screen is off.";
 				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Pathy records your routes in foreground and background.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Pathy needs your location to record tracks.";
 				INFOPLIST_KEY_NSMotionUsageDescription = "Pathy uses motion activity to auto-start walking tracks only.";
@@ -294,6 +295,7 @@
 				DEVELOPMENT_TEAM = Q7YH32RCVW;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSLocationAlwaysUsageDescription = "Pathy records your routes in background, even when screen is off.";
 				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Pathy records your routes in foreground and background.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Pathy needs your location to record tracks.";
 				INFOPLIST_KEY_NSMotionUsageDescription = "Pathy uses motion activity to auto-start walking tracks only.";
