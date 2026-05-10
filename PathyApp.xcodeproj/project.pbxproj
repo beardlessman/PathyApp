@@ -256,15 +256,13 @@
 				DEVELOPMENT_TEAM = Q7YH32RCVW;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = PathyApp-Info.plist;
 				INFOPLIST_KEY_NSLocationAlwaysUsageDescription = "Pathy records your routes in background, even when screen is off.";
 				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Pathy records your routes in foreground and background.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Pathy needs your location to record tracks.";
 				INFOPLIST_KEY_NSMotionUsageDescription = "Pathy uses motion activity to auto-start walking tracks only.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
-				INFOPLIST_KEY_UIBackgroundModes = (
-					location,
-				);
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
@@ -295,15 +293,13 @@
 				DEVELOPMENT_TEAM = Q7YH32RCVW;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = PathyApp-Info.plist;
 				INFOPLIST_KEY_NSLocationAlwaysUsageDescription = "Pathy records your routes in background, even when screen is off.";
 				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Pathy records your routes in foreground and background.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Pathy needs your location to record tracks.";
 				INFOPLIST_KEY_NSMotionUsageDescription = "Pathy uses motion activity to auto-start walking tracks only.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
-				INFOPLIST_KEY_UIBackgroundModes = (
-					location,
-				);
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";

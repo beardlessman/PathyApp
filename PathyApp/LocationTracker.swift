@@ -196,9 +196,14 @@ final class LocationTracker: NSObject, ObservableObject {
 
     /// - Parameter startedFromAutoTrigger: `true` when recording began via passive auto-start (`attemptPendingAutoStart`). Manual Start uses `false`.
     func startTracking(startedFromAutoTrigger: Bool = false) {
-        guard let modelContext else { return }
+        authorizationStatus = locationManager.authorizationStatus
+        guard let modelContext else {
+            logDebugEvent("startTracking aborted: SwiftData context not ready")
+            return
+        }
         cancelAutoStartVerificationIfActive(reason: "tracking started")
         guard authorizationStatus == .authorizedAlways else {
+            logDebugEvent("startTracking aborted: need «Always», got auth=\(authorizationStatus.rawValue)")
             locationManager.requestAlwaysAuthorization()
             return
         }
@@ -225,7 +230,16 @@ final class LocationTracker: NSObject, ObservableObject {
         isPaused = false
         startStationaryTimerIfNeeded()
         locationManager.startUpdatingLocation()
-        logDebugEvent("tracking started")
+        let bgListed = supportsBackgroundLocationMode
+        let allowsBg = locationManager.allowsBackgroundLocationUpdates
+        logDebugEvent(
+            "tracking started | plist_bg_location=\(bgListed ? 1 : 0) allows_bg_updates=\(allowsBg ? 1 : 0)"
+        )
+        if !bgListed {
+            logDebugEvent("⚠ UIBackgroundModes≠location → iOS won’t deliver GPS in suspend; check built Info.plist")
+        } else if !allowsBg {
+            logDebugEvent("⚠ allowsBackgroundLocationUpdates=false with Always auth — abnormal")
+        }
         ensureTrackingNotificationsPermissionIfNeeded()
         postTrackingStateNotification(isStarted: true)
     }
@@ -785,8 +799,19 @@ final class LocationTracker: NSObject, ObservableObject {
     }
 
     private var supportsBackgroundLocationMode: Bool {
-        let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String]
-        return modes?.contains("location") == true
+        guard let raw = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") else { return false }
+        if let modes = raw as? [String] {
+            return modes.contains("location")
+        }
+        if let modes = raw as? NSArray {
+            return modes.contains { object in
+                (object as? String) == "location"
+            }
+        }
+        if let single = raw as? String {
+            return single == "location"
+        }
+        return false
     }
 
     private func applyBackgroundLocationPolicy() {
@@ -1066,6 +1091,7 @@ final class LocationTracker: NSObject, ObservableObject {
         locationManager.pausesLocationUpdatesAutomatically = true
         locationManager.distanceFilter = economyDistanceFilter
         applyDesiredAccuracyIfNeeded(economyAccuracy)
+        refreshDebugConfiguration()
     }
 
     private func applyActiveTrackingLocationConfig() {
@@ -1077,6 +1103,7 @@ final class LocationTracker: NSObject, ObservableObject {
             locationManager.showsBackgroundLocationIndicator = true
         }
         applyDesiredAccuracyIfNeeded(activeTrackingAccuracy)
+        refreshDebugConfiguration()
     }
 
     /// Prefer course from GPS when valid; otherwise movement vector from spaced samples.
