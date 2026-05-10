@@ -15,7 +15,7 @@ import UIKit
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
-    @StateObject private var tracker = LocationTracker.shared
+    @EnvironmentObject private var tracker: LocationTracker
     @State private var tracks: [Track] = []
 
     @State private var trackDisplayStates: [UUID: TrackDisplayState] = [:]
@@ -920,4 +920,6 @@ private struct ShareSheet: UIViewControllerRepresentable {
 
 #Preview {
     ContentView()
+        .modelContainer(for: Track.self, inMemory: true)
+        .environmentObject(LocationTracker.shared)
 }

@@ -8,6 +8,7 @@ import CoreLocation
 import CoreMotion
 import Foundation
 import SwiftData
+import UIKit
 import UserNotifications
 
 @MainActor
@@ -90,6 +91,7 @@ final class LocationTracker: NSObject, ObservableObject {
     private let restTimestampKey = "restTimestamp"
     private let passiveGeofenceIdentifier = "resting-geofence"
     private let didAskTrackingNotificationPermissionKey = "didAskTrackingNotificationPermission"
+    private let lastAlwaysLocationEducationNotificationKey = "lastAlwaysLocationEducationNotificationAt"
     private let autoStartEnabledKey = "autoStartEnabled"
     /// Persisted alongside active track ID so restore knows whether to suppress automotive fixes.
     private let activeTrackingSessionAutoStartedKey = "activeTrackingSessionAutoStarted"
@@ -101,8 +103,9 @@ final class LocationTracker: NSObject, ObservableObject {
         super.init()
         locationManager.delegate = self
         locationManager.activityType = .fitness
+        authorizationStatus = locationManager.authorizationStatus
         applyEconomyLocationConfig()
-        locationManager.allowsBackgroundLocationUpdates = supportsBackgroundLocationMode
+        applyBackgroundLocationPolicy()
 
         let defaults = UserDefaults.standard
         if defaults.object(forKey: autoStartEnabledKey) == nil {
@@ -192,7 +195,9 @@ final class LocationTracker: NSObject, ObservableObject {
         clearActiveTrackID()
         persistRestLocationFromCurrentState()
         startPassiveMonitoringIfAuthorized()
-        try? modelContext?.save()
+        runPersistenceBackgroundTask {
+            try? modelContext?.save()
+        }
         postTrackingStateNotification(isStarted: false)
         logDebugEvent("tracking stopped")
     }
@@ -375,8 +380,25 @@ final class LocationTracker: NSObject, ObservableObject {
     private func flushCoordinates(forceSave: Bool) {
         guard let modelContext, let currentTrack else { return }
         currentTrack.replaceCoordinates(bufferedCoordinates)
-        if forceSave || bufferedCoordinates.count.isMultiple(of: 25) {
+        guard forceSave || bufferedCoordinates.count.isMultiple(of: 25) else { return }
+        runPersistenceBackgroundTask {
             try? modelContext.save()
+        }
+    }
+
+    /// Gives CoreLocation / scene teardown a few extra seconds to finish SwiftData writes when the app is not foreground-active.
+    private func runPersistenceBackgroundTask(_ work: () -> Void) {
+        var taskID = UIBackgroundTaskIdentifier.invalid
+        taskID = UIApplication.shared.beginBackgroundTask(withName: "pathy.track-persist") {
+            if taskID != .invalid {
+                UIApplication.shared.endBackgroundTask(taskID)
+                taskID = .invalid
+            }
+        }
+        work()
+        if taskID != .invalid {
+            UIApplication.shared.endBackgroundTask(taskID)
+            taskID = .invalid
         }
     }
 
@@ -616,6 +638,14 @@ final class LocationTracker: NSObject, ObservableObject {
         return modes?.contains("location") == true
     }
 
+    private func applyBackgroundLocationPolicy() {
+        let enabled = supportsBackgroundLocationMode
+        locationManager.allowsBackgroundLocationUpdates = enabled
+        if enabled {
+            locationManager.showsBackgroundLocationIndicator = true
+        }
+    }
+
     private func armDeferredUpdates() {
         guard !isTracking else { return }
         guard CLLocationManager.deferredLocationUpdatesAvailable() else { return }
@@ -786,6 +816,48 @@ final class LocationTracker: NSObject, ObservableObject {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
+    /// Local notice when only «When In Use» is granted: background / screen-off recording needs «Always».
+    private func scheduleAlwaysAccessReminderIfNeeded() {
+        guard authorizationStatus == .authorizedWhenInUse else { return }
+
+        let defaults = UserDefaults.standard
+        let last = defaults.double(forKey: lastAlwaysLocationEducationNotificationKey)
+        let now = Date().timeIntervalSince1970
+        let minInterval: TimeInterval = 24 * 60 * 60
+        guard now - last >= minInterval else { return }
+        defaults.set(now, forKey: lastAlwaysLocationEducationNotificationKey)
+
+        let deliver: () -> Void = {
+            let content = UNMutableNotificationContent()
+            content.title = "Нужен доступ «Всегда»"
+            content.body =
+                "Чтобы трек записывался в фоне и при выключенном экране, откройте Настройки → Конфиденциальность и безопасность → Службы геолокации → Pathy и выберите «Всегда»."
+            content.sound = .default
+            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1.5, repeats: false)
+            let request = UNNotificationRequest(
+                identifier: "pathy-always-location-education",
+                content: content,
+                trigger: trigger
+            )
+            UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+        }
+
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            switch settings.authorizationStatus {
+            case .authorized, .provisional, .ephemeral:
+                deliver()
+            case .notDetermined:
+                UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
+                    if granted {
+                        deliver()
+                    }
+                }
+            default:
+                break
+            }
+        }
+    }
+
     private func postTrackingStateNotification(isStarted: Bool) {
         guard !isPaused else { return }
 
@@ -932,6 +1004,7 @@ extension LocationTracker: CLLocationManagerDelegate {
             if manager.authorizationStatus == .authorizedWhenInUse {
                 // Background recording requires Always authorization.
                 manager.requestAlwaysAuthorization()
+                scheduleAlwaysAccessReminderIfNeeded()
             }
             if manager.authorizationStatus == .authorizedAlways {
                 restorePassiveMonitoringIfNeeded()
