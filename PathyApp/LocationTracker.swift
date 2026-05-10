@@ -69,6 +69,10 @@ final class LocationTracker: NSObject, ObservableObject {
     private let gpsJumpDistanceThreshold: CLLocationDistance = 500
     private let gpsJumpTimeThreshold: TimeInterval = 10
     private let stationaryTimeout: TimeInterval = 15 * 60
+    /// Progressive filter QA: set each to `true` to match production gates step by step.
+    private let appendFilter_wallClockSkew = true
+    private let appendFilter_horizontalAccuracy = true
+    private let appendFilter_shouldPersist = true
     private let economyAccuracy = kCLLocationAccuracyBest
     private let activeTrackingAccuracy = kCLLocationAccuracyBestForNavigation
     private let economyDistanceFilter: CLLocationDistance = 1.6
@@ -313,18 +317,27 @@ final class LocationTracker: NSObject, ObservableObject {
         guard isTracking, !isPaused else { return }
         guard let modelContext, let currentTrack else { return }
 
-        let wallSkew = Date().timeIntervalSince(location.timestamp)
-        if wallSkew > maxLocationWallClockSkewSeconds { return }
-        if wallSkew < -2 { return }
-
-        guard location.horizontalAccuracy > 0, location.horizontalAccuracy <= maxHorizontalAccuracyToRecord else { return }
-        guard shouldPersistLocation(location) else {
-            updateDebugLocationSnapshot(location, source: "active")
-            updateGPSQuality(with: location.horizontalAccuracy)
-            evaluateAdaptiveAccuracy(with: location)
-            evaluateMovementState(with: location)
-            return
+        if appendFilter_wallClockSkew {
+            let wallSkew = Date().timeIntervalSince(location.timestamp)
+            if wallSkew > maxLocationWallClockSkewSeconds { return }
+            if wallSkew < -2 { return }
         }
+
+        if appendFilter_horizontalAccuracy {
+            guard location.horizontalAccuracy > 0, location.horizontalAccuracy <= maxHorizontalAccuracyToRecord else { return }
+        }
+
+        if appendFilter_shouldPersist {
+            guard shouldPersistLocation(location) else {
+                updateDebugLocationSnapshot(location, source: "active")
+                updateGPSQuality(with: location.horizontalAccuracy)
+                evaluateAdaptiveAccuracy(with: location)
+                evaluateMovementState(with: location)
+                return
+            }
+        }
+
+        let storedAccuracy: Double? = location.horizontalAccuracy > 0 ? location.horizontalAccuracy : nil
 
         bufferedCoordinates.append(
             TrackCoordinate(
@@ -332,14 +345,16 @@ final class LocationTracker: NSObject, ObservableObject {
                 longitude: location.coordinate.longitude,
                 course: location.course >= 0 ? location.course : nil,
                 speed: location.speed >= 0 ? location.speed : nil,
-                horizontalAccuracy: location.horizontalAccuracy,
+                horizontalAccuracy: storedAccuracy,
                 timestamp: location.timestamp
             )
         )
         liveTrackCoordinates = bufferedCoordinates
         onCoordinateRecorded?(location.coordinate)
         updateDebugLocationSnapshot(location, source: "active")
-        updateGPSQuality(with: location.horizontalAccuracy)
+        if location.horizontalAccuracy > 0 {
+            updateGPSQuality(with: location.horizontalAccuracy)
+        }
 
         evaluateAdaptiveAccuracy(with: location)
         evaluateMovementState(with: location)
@@ -469,24 +484,30 @@ final class LocationTracker: NSObject, ObservableObject {
             return
         }
 
-        guard let lastSignificantLocation, let lastSignificantMovementAt else { return }
-        let distance = location.distance(from: lastSignificantLocation)
-        let dt = max(1, location.timestamp.timeIntervalSince(lastSignificantMovementAt))
+        guard let priorSignificantLocation = lastSignificantLocation, let priorMovementAt = lastSignificantMovementAt else { return }
+        let distance = location.distance(from: priorSignificantLocation)
+        let dt = max(1, location.timestamp.timeIntervalSince(priorMovementAt))
         let inferredSpeed = distance / dt
         let adaptiveDistanceThreshold = max(
             significantMovementThreshold,
-            max(location.horizontalAccuracy, lastSignificantLocation.horizontalAccuracy) * 2
+            max(location.horizontalAccuracy, priorSignificantLocation.horizontalAccuracy) * 2
         )
 
         if distance >= adaptiveDistanceThreshold && inferredSpeed >= significantMovementMinSpeed {
-            self.lastSignificantLocation = location
-            self.lastSignificantMovementAt = location.timestamp
-            self.debugLastSignificantMovementAt = self.lastSignificantMovementAt
-            self.updateStationaryDebugFields(now: location.timestamp)
+            // GPS drift while the user is actually still (e.g. phone on a table) can look like movement
+            // and keep resetting the auto-stop clock — ignore it when Motion clearly reports stationary.
+            if isLikelyStationaryNow() {
+                evaluateStationaryTimeout(now: Date())
+                return
+            }
+            lastSignificantLocation = location
+            lastSignificantMovementAt = location.timestamp
+            debugLastSignificantMovementAt = lastSignificantMovementAt
+            updateStationaryDebugFields(now: location.timestamp)
             return
         }
 
-        evaluateStationaryTimeout(now: location.timestamp)
+        evaluateStationaryTimeout(now: Date())
     }
 
     private func restoreActiveTrackingIfNeeded() {
@@ -1162,6 +1183,9 @@ extension LocationTracker: CLLocationManagerDelegate {
                 appendLocation(location)
             }
             if isTracking, !isPaused {
+                // `Timer` often does not fire on schedule when the app is suspended; location callbacks
+                // still wake the process — check wall-clock stationary timeout every batch.
+                evaluateStationaryTimeout(now: Date())
                 armDeferredUpdates()
             }
         } else if pendingDebugLocationScan, let latest = locations.last {
