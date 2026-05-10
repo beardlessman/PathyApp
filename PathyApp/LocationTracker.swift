@@ -55,8 +55,17 @@ final class LocationTracker: NSObject, ObservableObject {
 
     private let significantMovementThreshold: CLLocationDistance = 20
     private let maxWalkingAutoStartSpeed: CLLocationSpeed = 2.8
-    private let autoStartDistanceThreshold: CLLocationDistance = 50
-    private let geofenceRadius: CLLocationDistance = 200
+    /// Coarse wake: iOS geofence; Apple recommends ~100m minimum for reliable region events.
+    private let passiveWakeGeofenceRadius: CLLocationDistance = 100
+    /// Fine trigger after wake: user must move this far from rest (on quality-filtered fixes).
+    private let autoStartVerificationDistanceThreshold: CLLocationDistance = 20
+    /// Single-fix fast path: large separation with excellent accuracy (reduces wait for 2nd sample).
+    private let autoStartStrongDistanceThreshold: CLLocationDistance = 35
+    private let autoStartStrongAccuracyCap: CLLocationAccuracy = 22
+    private let verificationDistanceFilter: CLLocationDistance = 10
+    private let verificationMaxHorizontalAccuracy: CLLocationAccuracy = 50
+    private let verificationMinGoodSamples = 2
+    private let verificationPhaseTimeout: TimeInterval = 48
     private let gpsJumpDistanceThreshold: CLLocationDistance = 500
     private let gpsJumpTimeThreshold: TimeInterval = 10
     private let stationaryTimeout: TimeInterval = 15 * 60
@@ -81,10 +90,17 @@ final class LocationTracker: NSObject, ObservableObject {
     private let suspiciousJumpDistanceThreshold: CLLocationDistance = 120
     private let suspiciousJumpSpeedThreshold: CLLocationSpeed = 12
     private let suspiciousJumpPoorAccuracyThreshold: CLLocationAccuracy = 20
+    /// Reject cached / replayed fixes (common right after unlock) vs wall clock.
+    private let maxLocationWallClockSkewSeconds: TimeInterval = 25
+    /// Pocket / weak GPS: drop very poor fixes while still allowing a usable trail (ТЗ ≤ 60 m).
+    private let maxHorizontalAccuracyToRecord: CLLocationAccuracy = 60
     private var lastBearingPoint: CLLocation?
     private var lastHorizontalAccuracy: CLLocationAccuracy?
     private var highAccuracyWorkItem: DispatchWorkItem?
     private var stationaryCheckTimer: Timer?
+    /// Bridges inactive → background so Core Location keeps priority before the blue-indicator session fully owns execution time.
+    private var resignActiveBackgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+    private var endLocationHandoffBridgeWorkItem: DispatchWorkItem?
     private let activeTrackIDKey = "activeTrackingTrackID"
     private let restLatitudeKey = "restLatitude"
     private let restLongitudeKey = "restLongitude"
@@ -98,6 +114,11 @@ final class LocationTracker: NSObject, ObservableObject {
 
     /// True when recording was initiated by passive auto-start (not Start button); used to skip automotive segments.
     private var currentSessionStartedFromAutoTrigger = false
+
+    /// High-accuracy GPS pass after exiting the 100m rest geofence (before committing auto-start).
+    private var isAutoStartVerificationActive = false
+    private var autoStartVerificationGoodSamples = 0
+    private var autoStartVerificationTimeoutWorkItem: DispatchWorkItem?
 
     private override init() {
         super.init()
@@ -141,9 +162,38 @@ final class LocationTracker: NSObject, ObservableObject {
         restorePassiveMonitoringIfNeeded()
     }
 
+    func beginBackgroundBridgeForLocationHandoff() {
+        guard isTracking, !isPaused else { return }
+        endBackgroundBridgeForLocationHandoff()
+        resignActiveBackgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "pathy.location-handoff") { [weak self] in
+            Task { @MainActor in
+                self?.endBackgroundBridgeForLocationHandoff()
+            }
+        }
+    }
+
+    func endBackgroundBridgeForLocationHandoff() {
+        endLocationHandoffBridgeWorkItem?.cancel()
+        endLocationHandoffBridgeWorkItem = nil
+        if resignActiveBackgroundTaskID != .invalid {
+            UIApplication.shared.endBackgroundTask(resignActiveBackgroundTaskID)
+            resignActiveBackgroundTaskID = .invalid
+        }
+    }
+
+    func scheduleEndBackgroundBridgeAfterLocationHandoff() {
+        endLocationHandoffBridgeWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.endBackgroundBridgeForLocationHandoff()
+        }
+        endLocationHandoffBridgeWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: work)
+    }
+
     /// - Parameter startedFromAutoTrigger: `true` when recording began via passive auto-start (`attemptPendingAutoStart`). Manual Start uses `false`.
     func startTracking(startedFromAutoTrigger: Bool = false) {
         guard let modelContext else { return }
+        cancelAutoStartVerificationIfActive(reason: "tracking started")
         guard authorizationStatus == .authorizedAlways else {
             locationManager.requestAlwaysAuthorization()
             return
@@ -195,6 +245,7 @@ final class LocationTracker: NSObject, ObservableObject {
         clearActiveTrackID()
         persistRestLocationFromCurrentState()
         startPassiveMonitoringIfAuthorized()
+        endBackgroundBridgeForLocationHandoff()
         runPersistenceBackgroundTask {
             try? modelContext?.save()
         }
@@ -211,6 +262,7 @@ final class LocationTracker: NSObject, ObservableObject {
         applyEconomyLocationConfig()
         locationManager.stopUpdatingLocation()
         locationManager.disallowDeferredLocationUpdates()
+        endBackgroundBridgeForLocationHandoff()
         flushCoordinates(forceSave: true)
         logDebugEvent("tracking paused")
     }
@@ -250,6 +302,7 @@ final class LocationTracker: NSObject, ObservableObject {
             attemptPendingAutoStart()
         } else {
             pendingAutoStartLocation = nil
+            cancelAutoStartVerificationIfActive(reason: "auto-start disabled")
             locationManager.stopMonitoringSignificantLocationChanges()
             stopRestGeofenceIfNeeded()
         }
@@ -259,7 +312,12 @@ final class LocationTracker: NSObject, ObservableObject {
     private func appendLocation(_ location: CLLocation) {
         guard isTracking, !isPaused else { return }
         guard let modelContext, let currentTrack else { return }
-        guard location.horizontalAccuracy > 0, location.horizontalAccuracy <= 100 else { return }
+
+        let wallSkew = Date().timeIntervalSince(location.timestamp)
+        if wallSkew > maxLocationWallClockSkewSeconds { return }
+        if wallSkew < -2 { return }
+
+        guard location.horizontalAccuracy > 0, location.horizontalAccuracy <= maxHorizontalAccuracyToRecord else { return }
         guard shouldPersistLocation(location) else {
             updateDebugLocationSnapshot(location, source: "active")
             updateGPSQuality(with: location.horizontalAccuracy)
@@ -486,23 +544,28 @@ final class LocationTracker: NSObject, ObservableObject {
     private func startPassiveMonitoringIfAuthorized() {
         guard isAutoStartEnabled else { return }
         guard authorizationStatus == .authorizedAlways else { return }
-        locationManager.startMonitoringSignificantLocationChanges()
+        locationManager.stopMonitoringSignificantLocationChanges()
         restoreRestGeofenceIfPossible()
     }
 
     private func restoreRestGeofenceIfPossible() {
         guard let restLocation = loadRestLocation() else { return }
-        createRestGeofence(center: restLocation.coordinate)
+        if CLLocationManager.isMonitoringAvailable(for: CLCircularRegion.self) {
+            createRestGeofence(center: restLocation.coordinate)
+        } else {
+            locationManager.startMonitoringSignificantLocationChanges()
+            logDebugEvent("passive fallback: significant location (geofence unavailable)")
+        }
     }
 
     private func createRestGeofence(center: CLLocationCoordinate2D) {
         stopRestGeofenceIfNeeded()
         guard CLLocationManager.isMonitoringAvailable(for: CLCircularRegion.self) else { return }
-        let region = CLCircularRegion(center: center, radius: geofenceRadius, identifier: passiveGeofenceIdentifier)
+        let region = CLCircularRegion(center: center, radius: passiveWakeGeofenceRadius, identifier: passiveGeofenceIdentifier)
         debugGeofenceActive = true
         debugRestCoordinate = center
-        logDebugEvent("rest geofence armed")
-        region.notifyOnEntry = false
+        logDebugEvent("rest geofence armed (\(Int(passiveWakeGeofenceRadius))m wake)")
+        region.notifyOnEntry = true
         region.notifyOnExit = true
         locationManager.startMonitoring(for: region)
     }
@@ -555,43 +618,110 @@ final class LocationTracker: NSObject, ObservableObject {
         )
     }
 
-    private func evaluatePassiveTrigger(with location: CLLocation) {
-        if !isAutoStartEnabled { return }
-        if isTracking { return }
-        if authorizationStatus != .authorizedAlways {
-            logDebugEvent("auto-start blocked: no always authorization")
+    private func startAutoStartVerificationPhase() {
+        guard isAutoStartEnabled else { return }
+        guard !isTracking else { return }
+        guard authorizationStatus == .authorizedAlways else { return }
+        guard modelContext != nil else {
+            logDebugEvent("auto-start verification skipped: no model context")
             return
         }
-        if !isLikelyWalkingForAutoStart(at: location) {
-            logDebugEvent("auto-start blocked: not walking")
-            return
-        }
+        guard loadRestLocation() != nil else { return }
+        guard !isAutoStartVerificationActive else { return }
 
-        updateDebugLocationSnapshot(location, source: "passive")
-        updateDistanceToRest(from: location)
+        isAutoStartVerificationActive = true
+        autoStartVerificationGoodSamples = 0
+        lastPassiveTriggerLocation = nil
+        lastPassiveTriggerAt = nil
 
-        if let lastPassiveTriggerLocation, let lastPassiveTriggerAt {
-            let distance = location.distance(from: lastPassiveTriggerLocation)
-            let dt = location.timestamp.timeIntervalSince(lastPassiveTriggerAt)
-            if dt > 0, dt <= gpsJumpTimeThreshold, distance >= gpsJumpDistanceThreshold {
-                logDebugEvent("auto-start blocked: gps jump filtered")
-                return
+        autoStartVerificationTimeoutWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.cancelAutoStartVerificationIfActive(reason: "timeout")
             }
         }
-        lastPassiveTriggerLocation = location
-        lastPassiveTriggerAt = location.timestamp
+        autoStartVerificationTimeoutWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + verificationPhaseTimeout, execute: work)
 
+        applyAutoStartVerificationLocationConfig()
+        locationManager.startUpdatingLocation()
+        logDebugEvent("auto-start verification: high accuracy on")
+    }
+
+    private func applyAutoStartVerificationLocationConfig() {
+        locationManager.pausesLocationUpdatesAutomatically = false
+        locationManager.distanceFilter = verificationDistanceFilter
+        applyDesiredAccuracyIfNeeded(kCLLocationAccuracyBest)
+        locationManager.activityType = .otherNavigation
+        refreshDebugConfiguration()
+    }
+
+    private func cancelAutoStartVerificationIfActive(reason: String) {
+        guard isAutoStartVerificationActive else { return }
+        autoStartVerificationTimeoutWorkItem?.cancel()
+        autoStartVerificationTimeoutWorkItem = nil
+        isAutoStartVerificationActive = false
+        autoStartVerificationGoodSamples = 0
+        locationManager.stopUpdatingLocation()
+        locationManager.activityType = .fitness
+        applyEconomyLocationConfig()
+        refreshDebugConfiguration()
+        logDebugEvent("auto-start verification off (\(reason))")
+    }
+
+    private func processAutoStartVerificationUpdates(_ locations: [CLLocation]) {
         guard let restLocation = loadRestLocation() else {
-            pendingAutoStartLocation = location
-            logDebugEvent("auto-start candidate: no rest point")
-            attemptPendingAutoStart()
+            cancelAutoStartVerificationIfActive(reason: "no rest point")
             return
         }
 
-        if location.distance(from: restLocation) >= autoStartDistanceThreshold {
+        for location in locations {
+            updateDebugLocationSnapshot(location, source: "verification")
+            updateDistanceToRest(from: location)
+
+            if let lastPassiveTriggerLocation, let lastPassiveTriggerAt {
+                let jumpDistance = location.distance(from: lastPassiveTriggerLocation)
+                let dt = location.timestamp.timeIntervalSince(lastPassiveTriggerAt)
+                if dt > 0, dt <= gpsJumpTimeThreshold, jumpDistance >= gpsJumpDistanceThreshold {
+                    logDebugEvent("auto-start verification: jump filtered")
+                    continue
+                }
+            }
+            lastPassiveTriggerLocation = location
+            lastPassiveTriggerAt = location.timestamp
+
+            let distanceFromRest = location.distance(from: restLocation)
+            let accuracy = location.horizontalAccuracy
+            let accuracyOKForCount = accuracy > 0 && accuracy <= verificationMaxHorizontalAccuracy
+            if accuracyOKForCount {
+                autoStartVerificationGoodSamples += 1
+            }
+
+            let standardPath = autoStartVerificationGoodSamples >= verificationMinGoodSamples
+                && distanceFromRest > autoStartVerificationDistanceThreshold
+            let strongSingletonPath = accuracyOKForCount
+                && accuracy <= autoStartStrongAccuracyCap
+                && distanceFromRest > autoStartStrongDistanceThreshold
+                && autoStartVerificationGoodSamples >= 1
+
+            guard standardPath || strongSingletonPath else { continue }
+            guard isLikelyWalkingForAutoStart(at: location) else {
+                logDebugEvent("auto-start verification: blocked not walking")
+                continue
+            }
+
+            logDebugEvent("auto-start verification: confirmed (\(Int(distanceFromRest))m)")
+            autoStartVerificationTimeoutWorkItem?.cancel()
+            autoStartVerificationTimeoutWorkItem = nil
+            isAutoStartVerificationActive = false
+            autoStartVerificationGoodSamples = 0
+            locationManager.stopUpdatingLocation()
+            locationManager.activityType = .fitness
+            applyEconomyLocationConfig()
+            refreshDebugConfiguration()
             pendingAutoStartLocation = location
-            logDebugEvent("auto-start candidate: rest distance threshold met")
             attemptPendingAutoStart()
+            return
         }
     }
 
@@ -920,6 +1050,11 @@ final class LocationTracker: NSObject, ObservableObject {
     private func applyActiveTrackingLocationConfig() {
         locationManager.pausesLocationUpdatesAutomatically = false
         locationManager.distanceFilter = activeTrackingDistanceFilter
+        locationManager.activityType = .fitness
+        if supportsBackgroundLocationMode {
+            locationManager.allowsBackgroundLocationUpdates = true
+            locationManager.showsBackgroundLocationIndicator = true
+        }
         applyDesiredAccuracyIfNeeded(activeTrackingAccuracy)
     }
 
@@ -933,7 +1068,7 @@ final class LocationTracker: NSObject, ObservableObject {
         }
         lastHorizontalAccuracy = h
 
-        guard location.horizontalAccuracy <= 65 else { return }
+        guard location.horizontalAccuracy <= maxHorizontalAccuracyToRecord else { return }
 
         if location.course >= 0, location.speed >= 0.5 {
             if let last = lastBearingPoint, last.course >= 0, last.speed >= 0.5 {
@@ -1014,46 +1149,55 @@ extension LocationTracker: CLLocationManagerDelegate {
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        Task { @MainActor in
-            if isTracking {
-                guard !isPaused else { return }
-                for location in locations {
-                    guard isTracking, !isPaused else { break }
-                    appendLocation(location)
-                }
-                if isTracking, !isPaused {
-                    armDeferredUpdates()
-                }
-            } else if let latest = locations.last {
-                if pendingDebugLocationScan {
-                    updateDebugLocationSnapshot(latest, source: "debug")
-                    logDebugEvent("debug location scan success")
-                    pendingDebugLocationScan = false
-                    return
-                }
-                evaluatePassiveTrigger(with: latest)
+        MainActor.assumeIsolated {
+            handleDidUpdateLocations(locations)
+        }
+    }
+
+    private func handleDidUpdateLocations(_ locations: [CLLocation]) {
+        if isTracking {
+            guard !isPaused else { return }
+            for location in locations {
+                guard isTracking, !isPaused else { break }
+                appendLocation(location)
             }
+            if isTracking, !isPaused {
+                armDeferredUpdates()
+            }
+        } else if pendingDebugLocationScan, let latest = locations.last {
+            updateDebugLocationSnapshot(latest, source: "debug")
+            logDebugEvent("debug location scan success")
+            pendingDebugLocationScan = false
+        } else if isAutoStartVerificationActive {
+            processAutoStartVerificationUpdates(locations)
         }
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didExitRegion region: CLRegion) {
         guard region.identifier == passiveGeofenceIdentifier else { return }
         Task { @MainActor in
-            logDebugEvent("passive geofence exit")
-            if let location = manager.location {
-                evaluatePassiveTrigger(with: location)
-            } else if let restLocation = loadRestLocation() {
-                evaluatePassiveTrigger(with: restLocation)
-            }
+            logDebugEvent("passive geofence exit → verification")
+            startAutoStartVerificationPhase()
         }
     }
 
+    nonisolated func locationManager(_ manager: CLLocationManager, didEnterRegion region: CLRegion) {
+        guard region.identifier == passiveGeofenceIdentifier else { return }
+        Task { @MainActor in
+            guard isAutoStartVerificationActive else { return }
+            logDebugEvent("passive geofence re-entry → cancel verification")
+            cancelAutoStartVerificationIfActive(reason: "re-entered rest region")
+        }
+    }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         Task { @MainActor in
             if pendingDebugLocationScan {
                 logDebugEvent("debug location scan failed: \((error as NSError).code)")
                 pendingDebugLocationScan = false
+            }
+            if isAutoStartVerificationActive {
+                cancelAutoStartVerificationIfActive(reason: "location error \((error as NSError).code)")
             }
         }
     }

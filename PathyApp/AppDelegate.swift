@@ -6,16 +6,27 @@
 import UIKit
 import UserNotifications
 
+@MainActor
 final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         UNUserNotificationCenter.current().delegate = self
-        Task { @MainActor in
-            LocationTracker.shared.handleDidFinishLaunching()
-        }
+        LocationTracker.shared.handleDidFinishLaunching()
         return true
+    }
+
+    func applicationWillResignActive(_ application: UIApplication) {
+        LocationTracker.shared.beginBackgroundBridgeForLocationHandoff()
+    }
+
+    func applicationDidBecomeActive(_ application: UIApplication) {
+        LocationTracker.shared.endBackgroundBridgeForLocationHandoff()
+    }
+
+    func applicationDidEnterBackground(_ application: UIApplication) {
+        LocationTracker.shared.scheduleEndBackgroundBridgeAfterLocationHandoff()
     }
 
     func userNotificationCenter(
