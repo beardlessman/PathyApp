@@ -66,6 +66,18 @@ final class LocationTracker: NSObject, ObservableObject {
     private let verificationMaxHorizontalAccuracy: CLLocationAccuracy = 50
     private let verificationMinGoodSamples = 2
     private let verificationPhaseTimeout: TimeInterval = 48
+    private let restSeedMaxHorizontalAccuracy: CLLocationAccuracy = 80
+    private let restSeedCachedLocationMaxAge: TimeInterval = 180
+    private let restSeedRequestTimeout: TimeInterval = 25
+    /// Must be well outside the 100 m wake geofence before rest can move (avoids resetting mid-walk).
+    private let restRelocateMinDistanceFromRest: CLLocationDistance = 400
+    /// Flight / city change without a recorded drive segment.
+    private let restRelocateTravelDistance: CLLocationDistance = 2_500
+    private let restRelocateMinStationaryDuration: TimeInterval = 45
+    /// Car likely parked: no fresh automotive shortly before we anchor rest at the curb.
+    private let restRelocateMinTimeSinceAutomotive: TimeInterval = 45
+    private let restRelocateAutomotiveRecencyWindow: TimeInterval = 45 * 60
+    private let restRelocateTravelMinStationaryDuration: TimeInterval = 15
     private let gpsJumpDistanceThreshold: CLLocationDistance = 500
     private let gpsJumpTimeThreshold: TimeInterval = 10
     private let stationaryTimeout: TimeInterval = 15 * 60
@@ -123,6 +135,10 @@ final class LocationTracker: NSObject, ObservableObject {
     private var isAutoStartVerificationActive = false
     private var autoStartVerificationGoodSamples = 0
     private var autoStartVerificationTimeoutWorkItem: DispatchWorkItem?
+    private var isPassiveRestLocationRequestActive = false
+    private var passiveRestLocationRequestTimeoutWorkItem: DispatchWorkItem?
+    private var lastAutomotiveActivityAt: Date?
+    private var passiveStationarySince: Date?
 
     private override init() {
         super.init()
@@ -147,6 +163,7 @@ final class LocationTracker: NSObject, ObservableObject {
         self.modelContext = modelContext
         restoreActiveTrackingIfNeeded()
         restorePassiveMonitoringIfNeeded()
+        maintainPassiveRestPointIfNeeded(trigger: "model context attached")
     }
 
     func requestPermissions() {
@@ -164,6 +181,11 @@ final class LocationTracker: NSObject, ObservableObject {
 
     func handleDidFinishLaunching() {
         restorePassiveMonitoringIfNeeded()
+        maintainPassiveRestPointIfNeeded(trigger: "app launch")
+    }
+
+    func handleAppBecameActive() {
+        maintainPassiveRestPointIfNeeded(trigger: "app became active")
     }
 
     func beginBackgroundBridgeForLocationHandoff() {
@@ -202,6 +224,7 @@ final class LocationTracker: NSObject, ObservableObject {
             return
         }
         cancelAutoStartVerificationIfActive(reason: "tracking started")
+        cancelPassiveRestLocationRequest(reason: "tracking started")
         guard authorizationStatus == .authorizedAlways else {
             logDebugEvent("startTracking aborted: need «Always», got auth=\(authorizationStatus.rawValue)")
             locationManager.requestAlwaysAuthorization()
@@ -317,8 +340,10 @@ final class LocationTracker: NSObject, ObservableObject {
 
         if enabled {
             restorePassiveMonitoringIfNeeded()
+            maintainPassiveRestPointIfNeeded(trigger: "auto-start enabled")
             attemptPendingAutoStart()
         } else {
+            cancelPassiveRestLocationRequest(reason: "auto-start disabled")
             pendingAutoStartLocation = nil
             cancelAutoStartVerificationIfActive(reason: "auto-start disabled")
             locationManager.stopMonitoringSignificantLocationChanges()
@@ -579,8 +604,12 @@ final class LocationTracker: NSObject, ObservableObject {
     private func startPassiveMonitoringIfAuthorized() {
         guard isAutoStartEnabled else { return }
         guard authorizationStatus == .authorizedAlways else { return }
-        locationManager.stopMonitoringSignificantLocationChanges()
         restoreRestGeofenceIfPossible()
+        if loadRestLocation() != nil {
+            locationManager.startMonitoringSignificantLocationChanges()
+        } else {
+            locationManager.stopMonitoringSignificantLocationChanges()
+        }
     }
 
     private func restoreRestGeofenceIfPossible() {
@@ -625,13 +654,233 @@ final class LocationTracker: NSObject, ObservableObject {
             location = locationManager.location
         }
         guard let location else { return }
+        persistRestLocation(location)
+    }
 
+    private func persistRestLocation(_ location: CLLocation) {
         let defaults = UserDefaults.standard
         defaults.set(location.coordinate.latitude, forKey: restLatitudeKey)
         defaults.set(location.coordinate.longitude, forKey: restLongitudeKey)
         defaults.set(location.timestamp.timeIntervalSince1970, forKey: restTimestampKey)
         createRestGeofence(center: location.coordinate)
         logDebugEvent("rest location persisted")
+    }
+
+    /// Seeds or relocates the passive rest anchor (no track) so auto-start stays valid after drives / travel.
+    private func maintainPassiveRestPointIfNeeded(trigger: String) {
+        guard isAutoStartEnabled else { return }
+        guard !isTracking else { return }
+        guard authorizationStatus == .authorizedAlways else { return }
+        guard !isAutoStartVerificationActive else { return }
+
+        if loadRestLocation() == nil {
+            seedRestLocationIfNeeded(trigger: trigger)
+        } else {
+            evaluateRestRelocationIfNeeded(trigger: trigger)
+        }
+    }
+
+    private func seedRestLocationIfNeeded(trigger: String) {
+        guard loadRestLocation() == nil else { return }
+
+        if let cached = locationManager.location,
+           isLocationAcceptableForRestSeed(cached, maxAge: restSeedCachedLocationMaxAge) {
+            establishRestLocation(from: cached, trigger: "\(trigger) seed (cached)")
+            return
+        }
+
+        beginPassiveRestLocationRequest(trigger: "\(trigger) seed")
+    }
+
+    private func evaluateRestRelocationIfNeeded(trigger: String) {
+        guard loadRestLocation() != nil else { return }
+        guard mightNeedRestRelocationSoon() else { return }
+
+        if let cached = locationManager.location,
+           isLocationAcceptableForRestSeed(cached, maxAge: restSeedCachedLocationMaxAge),
+           shouldRelocateRest(to: cached) {
+            establishRestLocation(from: cached, trigger: "\(trigger) relocate (cached)")
+            return
+        }
+
+        beginPassiveRestLocationRequest(trigger: "\(trigger) relocate")
+    }
+
+    private func mightNeedRestRelocationSoon() -> Bool {
+        guard let rest = loadRestLocation() else { return false }
+
+        if let cached = locationManager.location,
+           cached.distance(from: rest) >= restRelocateMinDistanceFromRest {
+            return true
+        }
+
+        if let automotiveAt = lastAutomotiveActivityAt,
+           Date().timeIntervalSince(automotiveAt) <= restRelocateAutomotiveRecencyWindow {
+            return true
+        }
+
+        return passiveStationarySince != nil
+    }
+
+    private func isLocationAcceptableForRestSeed(_ location: CLLocation, maxAge: TimeInterval? = nil) -> Bool {
+        let accuracy = location.horizontalAccuracy
+        guard accuracy > 0, accuracy <= restSeedMaxHorizontalAccuracy else { return false }
+
+        let wallSkew = Date().timeIntervalSince(location.timestamp)
+        if wallSkew > maxLocationWallClockSkewSeconds { return false }
+        if wallSkew < -2 { return false }
+
+        if let maxAge {
+            let age = Date().timeIntervalSince(location.timestamp)
+            guard age >= 0, age <= maxAge else { return false }
+        }
+
+        return true
+    }
+
+    private func establishRestLocation(from location: CLLocation, trigger: String) {
+        guard isLocationAcceptableForRestSeed(location) else { return }
+
+        cancelPassiveRestLocationRequest(reason: "rest established")
+        cancelAutoStartVerificationIfActive(reason: "rest established")
+        persistRestLocation(location)
+        updateDistanceToRest(from: location)
+        startPassiveMonitoringIfAuthorized()
+        logDebugEvent("rest established (\(trigger), ±\(Int(location.horizontalAccuracy))m)")
+    }
+
+    private func shouldRelocateRest(to location: CLLocation) -> Bool {
+        guard let rest = loadRestLocation() else { return false }
+        guard !isAutoStartVerificationActive else { return false }
+
+        let distance = location.distance(from: rest)
+        guard distance >= restRelocateMinDistanceFromRest else { return false }
+
+        if isAmbulatoryMotionForRestRelocate() {
+            return false
+        }
+
+        if distance >= restRelocateTravelDistance {
+            return hasBeenStationaryLongEnough(forTravelRelocate: true)
+        }
+
+        return qualifiesForParkedAfterDriveRelocate()
+    }
+
+    /// Do not move rest while the user is on foot away from the old anchor — auto-start needs that baseline.
+    private func isAmbulatoryMotionForRestRelocate() -> Bool {
+        guard let activity = latestMotionActivity else { return false }
+        guard activity.confidence != .low else { return false }
+        return activity.walking || activity.running || activity.cycling
+    }
+
+    private func qualifiesForParkedAfterDriveRelocate() -> Bool {
+        guard let automotiveAt = lastAutomotiveActivityAt else { return false }
+        guard Date().timeIntervalSince(automotiveAt) <= restRelocateAutomotiveRecencyWindow else { return false }
+        guard Date().timeIntervalSince(automotiveAt) >= restRelocateMinTimeSinceAutomotive else { return false }
+        return hasBeenStationaryLongEnough(forTravelRelocate: false)
+    }
+
+    private func hasBeenStationaryLongEnough(forTravelRelocate travel: Bool) -> Bool {
+        let required = travel ? restRelocateTravelMinStationaryDuration : restRelocateMinStationaryDuration
+        guard let activity = latestMotionActivity else { return travel }
+        guard activity.stationary, activity.confidence != .low else { return false }
+        guard let since = passiveStationarySince else { return false }
+        return Date().timeIntervalSince(since) >= required
+    }
+
+    private func beginPassiveRestLocationRequest(trigger: String) {
+        guard !isPassiveRestLocationRequestActive else { return }
+
+        isPassiveRestLocationRequestActive = true
+        passiveRestLocationRequestTimeoutWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.cancelPassiveRestLocationRequest(reason: "request timeout")
+            }
+        }
+        passiveRestLocationRequestTimeoutWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + restSeedRequestTimeout, execute: work)
+
+        logDebugEvent("passive rest location request (\(trigger))")
+        locationManager.requestLocation()
+    }
+
+    private func cancelPassiveRestLocationRequest(reason: String) {
+        guard isPassiveRestLocationRequestActive else { return }
+        passiveRestLocationRequestTimeoutWorkItem?.cancel()
+        passiveRestLocationRequestTimeoutWorkItem = nil
+        isPassiveRestLocationRequestActive = false
+        logDebugEvent("passive rest request off (\(reason))")
+    }
+
+    private func processPassiveRestLocationRequestUpdates(_ locations: [CLLocation]) {
+        for location in locations {
+            updateDebugLocationSnapshot(location, source: "passive-rest")
+            guard isLocationAcceptableForRestSeed(location) else { continue }
+
+            if loadRestLocation() == nil {
+                establishRestLocation(from: location, trigger: "location seed")
+            } else if shouldRelocateRest(to: location) {
+                establishRestLocation(from: location, trigger: "location relocate")
+            }
+            return
+        }
+    }
+
+    private func processPassiveRestRelocationCandidateUpdates(_ locations: [CLLocation]) {
+        guard let location = locations.last else { return }
+        updateDebugLocationSnapshot(location, source: "passive-sigloc")
+        guard isLocationAcceptableForRestSeed(location) else { return }
+        guard shouldRelocateRest(to: location) else { return }
+        establishRestLocation(from: location, trigger: "significant location")
+    }
+
+    private var canEvaluatePassiveRestRelocationFromLocationUpdates: Bool {
+        isAutoStartEnabled
+            && !isTracking
+            && !isPassiveRestLocationRequestActive
+            && !isAutoStartVerificationActive
+            && loadRestLocation() != nil
+    }
+
+    private func handleMotionActivityUpdate(_ activity: CMMotionActivity) {
+        latestMotionActivity = activity
+        lastMotionSummary = Self.describeMotionActivity(activity)
+
+        guard isAutoStartEnabled, !isTracking else { return }
+
+        if activity.automotive {
+            lastAutomotiveActivityAt = .now
+            passiveStationarySince = nil
+            return
+        }
+
+        if activity.walking || activity.running || activity.cycling {
+            passiveStationarySince = nil
+            return
+        }
+
+        if activity.stationary, activity.confidence != .low {
+            if passiveStationarySince == nil {
+                passiveStationarySince = .now
+            }
+            tryRelocateRestAfterMotionSettled()
+            return
+        }
+
+        passiveStationarySince = nil
+    }
+
+    private func tryRelocateRestAfterMotionSettled() {
+        guard loadRestLocation() != nil else { return }
+        guard !isAutoStartVerificationActive else { return }
+
+        let travelReady = hasBeenStationaryLongEnough(forTravelRelocate: true)
+        let parkedReady = qualifiesForParkedAfterDriveRelocate()
+        guard travelReady || parkedReady else { return }
+
+        evaluateRestRelocationIfNeeded(trigger: "motion settled")
     }
 
     private func loadRestLocation() -> CLLocation? {
@@ -654,6 +903,7 @@ final class LocationTracker: NSObject, ObservableObject {
     }
 
     private func startAutoStartVerificationPhase() {
+        cancelPassiveRestLocationRequest(reason: "auto-start verification")
         guard isAutoStartEnabled else { return }
         guard !isTracking else { return }
         guard authorizationStatus == .authorizedAlways else { return }
@@ -836,8 +1086,7 @@ final class LocationTracker: NSObject, ObservableObject {
         motionActivityManager.startActivityUpdates(to: queue) { [weak self] activity in
             guard let activity else { return }
             Task { @MainActor in
-                self?.latestMotionActivity = activity
-                self?.lastMotionSummary = Self.describeMotionActivity(activity)
+                self?.handleMotionActivityUpdate(activity)
             }
         }
     }
@@ -1191,6 +1440,7 @@ extension LocationTracker: CLLocationManagerDelegate {
             }
             if manager.authorizationStatus == .authorizedAlways {
                 restorePassiveMonitoringIfNeeded()
+                maintainPassiveRestPointIfNeeded(trigger: "always authorization")
                 attemptPendingAutoStart()
             }
         }
@@ -1219,8 +1469,12 @@ extension LocationTracker: CLLocationManagerDelegate {
             updateDebugLocationSnapshot(latest, source: "debug")
             logDebugEvent("debug location scan success")
             pendingDebugLocationScan = false
+        } else if isPassiveRestLocationRequestActive {
+            processPassiveRestLocationRequestUpdates(locations)
         } else if isAutoStartVerificationActive {
             processAutoStartVerificationUpdates(locations)
+        } else if canEvaluatePassiveRestRelocationFromLocationUpdates {
+            processPassiveRestRelocationCandidateUpdates(locations)
         }
     }
 
@@ -1246,6 +1500,9 @@ extension LocationTracker: CLLocationManagerDelegate {
             if pendingDebugLocationScan {
                 logDebugEvent("debug location scan failed: \((error as NSError).code)")
                 pendingDebugLocationScan = false
+            }
+            if isPassiveRestLocationRequestActive {
+                cancelPassiveRestLocationRequest(reason: "location error \((error as NSError).code)")
             }
             if isAutoStartVerificationActive {
                 cancelAutoStartVerificationIfActive(reason: "location error \((error as NSError).code)")

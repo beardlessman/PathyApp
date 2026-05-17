@@ -23,6 +23,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
 
     func applicationDidBecomeActive(_ application: UIApplication) {
         LocationTracker.shared.endBackgroundBridgeForLocationHandoff()
+        LocationTracker.shared.handleAppBecameActive()
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {
