@@ -46,6 +46,8 @@ final class LocationTracker: NSObject, ObservableObject {
     private var bufferedCoordinates: [TrackCoordinate] = []
     private var lastSignificantLocation: CLLocation?
     private var lastSignificantMovementAt: Date?
+    /// Previous fix passed to `evaluateMovementState` — used for per-segment speed, not anchor-averaged speed.
+    private var lastMovementEvaluationLocation: CLLocation?
     private var pendingAutoStartLocation: CLLocation?
     private var lastPassiveTriggerLocation: CLLocation?
     private var lastPassiveTriggerAt: Date?
@@ -239,6 +241,7 @@ final class LocationTracker: NSObject, ObservableObject {
         bufferedCoordinates = track.coordinates
         liveTrackCoordinates = bufferedCoordinates
         lastSignificantLocation = nil
+        lastMovementEvaluationLocation = nil
         lastSignificantMovementAt = .now
         debugLastSignificantMovementAt = lastSignificantMovementAt
         updateStationaryDebugFields(now: .now)
@@ -515,6 +518,8 @@ final class LocationTracker: NSObject, ObservableObject {
     }
 
     private func evaluateMovementState(with location: CLLocation) {
+        defer { lastMovementEvaluationLocation = location }
+
         if lastSignificantLocation == nil {
             lastSignificantLocation = location
             lastSignificantMovementAt = location.timestamp
@@ -523,16 +528,15 @@ final class LocationTracker: NSObject, ObservableObject {
             return
         }
 
-        guard let priorSignificantLocation = lastSignificantLocation, let priorMovementAt = lastSignificantMovementAt else { return }
+        guard let priorSignificantLocation = lastSignificantLocation else { return }
         let distance = location.distance(from: priorSignificantLocation)
-        let dt = max(1, location.timestamp.timeIntervalSince(priorMovementAt))
-        let inferredSpeed = distance / dt
+        let movementSpeed = significantMovementSpeed(from: location)
         let adaptiveDistanceThreshold = max(
             significantMovementThreshold,
             max(location.horizontalAccuracy, priorSignificantLocation.horizontalAccuracy) * 2
         )
 
-        if distance >= adaptiveDistanceThreshold && inferredSpeed >= significantMovementMinSpeed {
+        if distance >= adaptiveDistanceThreshold && movementSpeed >= significantMovementMinSpeed {
             // GPS drift while the user is actually still (e.g. phone on a table) can look like movement
             // and keep resetting the auto-stop clock — ignore it when Motion clearly reports stationary.
             if isLikelyStationaryNow() {
@@ -547,6 +551,22 @@ final class LocationTracker: NSObject, ObservableObject {
         }
 
         evaluateStationaryTimeout(now: Date())
+    }
+
+    /// Speed of the current fix vs the previous evaluated fix (and GPS speed when valid).
+    /// Must not average anchor distance over total idle time — that blocks timer reset after a short stop.
+    private func significantMovementSpeed(from location: CLLocation) -> CLLocationSpeed {
+        var candidates: [CLLocationSpeed] = []
+        if let previous = lastMovementEvaluationLocation {
+            let dt = location.timestamp.timeIntervalSince(previous.timestamp)
+            if dt > 0 {
+                candidates.append(location.distance(from: previous) / dt)
+            }
+        }
+        if location.speed >= 0 {
+            candidates.append(location.speed)
+        }
+        return candidates.max() ?? 0
     }
 
     private func restoreActiveTrackingIfNeeded() {
@@ -578,6 +598,7 @@ final class LocationTracker: NSObject, ObservableObject {
         lastSignificantLocation = bufferedCoordinates.last.map {
             CLLocation(latitude: $0.latitude, longitude: $0.longitude)
         }
+        lastMovementEvaluationLocation = lastSignificantLocation
         lastSignificantMovementAt = bufferedCoordinates
             .compactMap(\.timestamp)
             .max() ?? .now
