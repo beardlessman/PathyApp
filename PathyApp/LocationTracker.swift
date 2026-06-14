@@ -17,6 +17,7 @@ final class LocationTracker: NSObject, ObservableObject {
 
     @Published private(set) var isTracking = false
     @Published private(set) var isPaused = false
+    @Published private(set) var isPostProcessingTrack = false
     @Published private(set) var isAutoStartEnabled = true
     @Published private(set) var authorizationStatus: CLAuthorizationStatus = .notDetermined
     @Published private(set) var currentTrack: Track?
@@ -281,20 +282,55 @@ final class LocationTracker: NSObject, ObservableObject {
         locationManager.stopUpdatingLocation()
         locationManager.disallowDeferredLocationUpdates()
         flushCoordinates(forceSave: true)
-        currentTrack?.finishedAt = .now
+        let finishedTrack = currentTrack
+        let rawCoordinates = bufferedCoordinates
+        finishedTrack?.finishedAt = .now
         isTracking = false
         isPaused = false
         stopStationaryTimer()
-        liveTrackCoordinates = bufferedCoordinates
+        liveTrackCoordinates = rawCoordinates
         clearActiveTrackID()
         persistRestLocationFromCurrentState()
         startPassiveMonitoringIfAuthorized()
         endBackgroundBridgeForLocationHandoff()
-        runPersistenceBackgroundTask {
-            try? modelContext?.save()
-        }
         postTrackingStateNotification(isStarted: false)
         logDebugEvent("tracking stopped")
+        runPostProcessingIfNeeded(track: finishedTrack, rawCoordinates: rawCoordinates)
+    }
+
+    private func runPostProcessingIfNeeded(track: Track?, rawCoordinates: [TrackCoordinate]) {
+        guard let modelContext else { return }
+
+        guard let track else {
+            runPersistenceBackgroundTask {
+                try? modelContext.save()
+            }
+            return
+        }
+
+        let settings = TrackProcessingSettingsStore.load()
+        guard settings.isEnabled, rawCoordinates.count >= 2 else {
+            runPersistenceBackgroundTask {
+                try? modelContext.save()
+            }
+            return
+        }
+
+        isPostProcessingTrack = true
+        let rawCount = rawCoordinates.count
+        Task {
+            let processed = await Task.detached(priority: .userInitiated) {
+                TrackPostProcessor.process(rawCoordinates, settings: settings)
+            }.value
+
+            track.replaceCoordinates(processed)
+            liveTrackCoordinates = processed
+            isPostProcessingTrack = false
+            logDebugEvent("post-process: \(rawCount) → \(processed.count) pts")
+            runPersistenceBackgroundTask {
+                try? modelContext.save()
+            }
+        }
     }
 
     func pauseTracking() {

@@ -316,6 +316,13 @@ struct ContentView: View {
                     refreshTracks()
                 }
             }
+            .onChange(of: tracker.isPostProcessingTrack) { _, isProcessing in
+                guard !isProcessing else { return }
+                if let currentTrack = tracker.currentTrack {
+                    upsertLocalTrack(currentTrack)
+                }
+                refreshTracks()
+            }
             .animation(nil, value: isMapExpanded)
             .overlay {
                 if isBusy {
@@ -803,9 +810,26 @@ private struct SettingsView: View {
     let canBulkDeleteAllTracks: Bool
     let trackingBlocksBulkDeleteAll: Bool
 
+    @AppStorage("trackPostProcessingEnabled") private var postProcessingEnabled = true
+    @AppStorage("trackNoiseWindowSize") private var noiseWindowSize = 33
+    @AppStorage("trackRDPToleranceMeters") private var rdpToleranceMeters = 5.0
+    @AppStorage("trackChaikinIterations") private var chaikinIterations = 1
+
     @State private var tileCacheByteCount: Int64 = 0
     @State private var clearTilesConfirmation = false
     @State private var deleteAllTracksConfirmation = false
+
+    private var normalizedNoiseWindowSize: Int {
+        TrackProcessingSettingsStore.normalizedNoiseWindow(noiseWindowSize)
+    }
+
+    private var normalizedRDPTolerance: Double {
+        TrackProcessingSettingsStore.normalizedRDPTolerance(rdpToleranceMeters)
+    }
+
+    private var normalizedChaikinIterations: Int {
+        TrackProcessingSettingsStore.normalizedChaikinIterations(chaikinIterations)
+    }
 
     var body: some View {
         Form {
@@ -814,6 +838,61 @@ private struct SettingsView: View {
                     get: { isAutoStartEnabled },
                     set: setAutoStartEnabled
                 ))
+            }
+
+            Section {
+                Toggle("Post-process tracks", isOn: $postProcessingEnabled)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Noise smoothing")
+                        Spacer()
+                        Text("\(normalizedNoiseWindowSize) points")
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(
+                        value: Binding(
+                            get: { Double(normalizedNoiseWindowSize) },
+                            set: { noiseWindowSize = TrackProcessingSettingsStore.normalizedNoiseWindow(Int($0.rounded())) }
+                        ),
+                        in: 3...51,
+                        step: 2
+                    )
+                }
+                .disabled(!postProcessingEnabled)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Track simplification (RDP)")
+                        Spacer()
+                        Text(String(format: "%.1f m", normalizedRDPTolerance))
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(
+                        value: Binding(
+                            get: { normalizedRDPTolerance },
+                            set: { rdpToleranceMeters = TrackProcessingSettingsStore.normalizedRDPTolerance($0) }
+                        ),
+                        in: 0.5...20.0,
+                        step: 0.5
+                    )
+                }
+                .disabled(!postProcessingEnabled)
+
+                Stepper(
+                    "Corner smoothing: \(normalizedChaikinIterations) \(normalizedChaikinIterations == 1 ? "iteration" : "iterations")",
+                    value: Binding(
+                        get: { normalizedChaikinIterations },
+                        set: { chaikinIterations = TrackProcessingSettingsStore.normalizedChaikinIterations($0) }
+                    ),
+                    in: 0...3
+                )
+                .disabled(!postProcessingEnabled)
+            } header: {
+                Text("GPS filtering")
+            } footer: {
+                Text("Applied in the background when a recording finishes: noise filter → RDP → Chaikin.")
+                    .foregroundStyle(.secondary)
             }
 
             Section("Map tiles") {
