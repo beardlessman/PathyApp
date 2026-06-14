@@ -192,7 +192,7 @@ struct ContentView: View {
                                     }
                                 }
                         } else {
-                            Text(track.name)
+                            Text(TrackNameFormatter.displayName(for: track.name))
                                 .font(.headline)
                                 .foregroundStyle(nameColor(for: track))
                                 .onTapGesture {
@@ -279,10 +279,10 @@ struct ContentView: View {
             .fileImporter(
                 isPresented: $isImporting,
                 allowedContentTypes: [.xml, .gpx],
-                allowsMultipleSelection: false
+                allowsMultipleSelection: true
             ) { result in
-                if case let .success(urls) = result, let url = urls.first {
-                    importTrack(url: url)
+                if case let .success(urls) = result, !urls.isEmpty {
+                    importTracks(urls: urls)
                 }
             }
             .sheet(isPresented: Binding(
@@ -339,25 +339,40 @@ struct ContentView: View {
         }
     }
 
-    private func importTrack(url: URL) {
+    private func importTracks(urls: [URL]) {
         isImportingTrack = true
         Task { @MainActor in
-            let hasScopedAccess = url.startAccessingSecurityScopedResource()
+            defer { isImportingTrack = false }
+
+            var scopedURLs: [URL] = []
+            for url in urls {
+                if url.startAccessingSecurityScopedResource() {
+                    scopedURLs.append(url)
+                }
+            }
             defer {
-                if hasScopedAccess {
+                for url in scopedURLs {
                     url.stopAccessingSecurityScopedResource()
                 }
             }
 
             do {
-                let track = try GPXService.import(from: url, modelContext: modelContext)
-                upsertLocalTrack(track)
+                let imported = try GPXService.importTracks(from: urls, modelContext: modelContext)
+                for track in imported {
+                    upsertLocalTrack(track)
+                }
                 refreshTracks()
                 syncSelectionWithTracks()
+            } catch let batchError as GPXBatchImportError {
+                for track in batchError.partiallyImported {
+                    upsertLocalTrack(track)
+                }
+                refreshTracks()
+                syncSelectionWithTracks()
+                exportError = batchError.localizedDescription
             } catch {
                 exportError = "Unable to import GPX: \(error.localizedDescription)"
             }
-            isImportingTrack = false
         }
     }
 
@@ -438,10 +453,10 @@ struct ContentView: View {
     }
 
     private func refreshTracks() {
-        let descriptor = FetchDescriptor<Track>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
+        let descriptor = FetchDescriptor<Track>()
         do {
             let fetched = try modelContext.fetch(descriptor)
-            tracks = fetched
+            tracks = TrackNameFormatter.sortedByFirstPointDate(fetched)
         } catch {
             tracks = []
             exportError = "Unable to load tracks: \(error.localizedDescription)"
@@ -515,18 +530,22 @@ struct ContentView: View {
 
     private func beginTrackNameEdit(for track: Track) {
         editingTrackID = track.id
-        editingTrackName = track.name
+        editingTrackName = TrackNameFormatter.displayName(for: track.name)
     }
 
     private func commitTrackNameEdit(for track: Track) {
         guard editingTrackID == track.id else { return }
 
-        let newName = editingTrackName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newDisplayName = editingTrackName.trimmingCharacters(in: .whitespacesAndNewlines)
         editingTrackID = nil
 
-        guard !newName.isEmpty, newName != track.name else { return }
+        let currentDisplayName = TrackNameFormatter.displayName(for: track.name)
+        guard !newDisplayName.isEmpty, newDisplayName != currentDisplayName else { return }
 
-        track.name = newName
+        track.name = TrackNameFormatter.storedName(
+            fromDisplayName: newDisplayName,
+            preservingPrefixIn: track.name
+        )
         do {
             try modelContext.save()
             upsertLocalTrack(track)

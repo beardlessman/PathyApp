@@ -6,6 +6,15 @@
 import Foundation
 import SwiftData
 
+struct GPXBatchImportError: LocalizedError {
+    let partiallyImported: [Track]
+    let failures: [String]
+
+    var errorDescription: String? {
+        "Imported \(partiallyImported.count) track(s). Some files failed:\n" + failures.joined(separator: "\n")
+    }
+}
+
 enum GPXService {
     static func export(track: Track) throws -> URL {
         let safeName = track.name.replacingOccurrences(of: " ", with: "_")
@@ -46,7 +55,11 @@ enum GPXService {
         track.coordinates.compactMap(\.timestamp).min() ?? track.startedAt
     }
 
-    static func `import`(from url: URL, modelContext: ModelContext) throws -> Track {
+    static func `import`(
+        from url: URL,
+        modelContext: ModelContext,
+        saveImmediately: Bool = true
+    ) throws -> Track {
         let data = try Data(contentsOf: url)
         let parsed = try parseGPXDocument(data: data)
         let points = parsed.points
@@ -55,13 +68,55 @@ enum GPXService {
                 NSLocalizedDescriptionKey: "No track points found in selected GPX file."
             ])
         }
-        let fallbackName = url.deletingPathExtension().lastPathComponent
-        let track = Track(name: parsed.trackName ?? fallbackName, startedAt: .now)
+        let timestamps = points.compactMap(\.timestamp)
+        let startedAt = timestamps.min() ?? .now
+        let finishedAt = timestamps.max() ?? startedAt
+        let trackName = TrackNameFormatter.importedTrackName(from: startedAt)
+        let track = Track(name: trackName, startedAt: startedAt)
         modelContext.insert(track)
         track.replaceCoordinates(points)
-        track.finishedAt = .now
-        try modelContext.save()
+        track.finishedAt = finishedAt
+        if saveImmediately {
+            try modelContext.save()
+        }
         return track
+    }
+
+    static func importTracks(from urls: [URL], modelContext: ModelContext) throws -> [Track] {
+        var imported: [Track] = []
+        imported.reserveCapacity(urls.count)
+        var failures: [String] = []
+
+        for url in urls.sorted(by: { lhs, rhs in
+            lhs.deletingPathExtension().lastPathComponent.localizedStandardCompare(
+                rhs.deletingPathExtension().lastPathComponent
+            ) == .orderedAscending
+        }) {
+            do {
+                imported.append(try Self.import(from: url, modelContext: modelContext, saveImmediately: false))
+            } catch {
+                failures.append("\(url.deletingPathExtension().lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+
+        if !imported.isEmpty {
+            try modelContext.save()
+        }
+
+        if imported.isEmpty {
+            let message = failures.isEmpty
+                ? "No GPX files were imported."
+                : failures.joined(separator: "\n")
+            throw NSError(domain: "GPXImport", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: message
+            ])
+        }
+
+        if !failures.isEmpty {
+            throw GPXBatchImportError(partiallyImported: imported, failures: failures)
+        }
+
+        return imported
     }
 
     static func parseGPX(data: Data) throws -> [TrackCoordinate] {
@@ -74,10 +129,13 @@ enum GPXService {
     }
 
     static func importParsedPoints(_ points: [TrackCoordinate], trackName: String, modelContext: ModelContext) throws -> Track {
-        let track = Track(name: trackName, startedAt: .now)
+        let timestamps = points.compactMap(\.timestamp)
+        let startedAt = timestamps.min() ?? .now
+        let finishedAt = timestamps.max() ?? startedAt
+        let track = Track(name: trackName, startedAt: startedAt)
         modelContext.insert(track)
         track.replaceCoordinates(points)
-        track.finishedAt = .now
+        track.finishedAt = finishedAt
         try modelContext.save()
         return track
     }

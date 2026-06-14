@@ -214,7 +214,6 @@ enum TrackGeometryCodec {
     }
 }
 
-
 extension Track {
     var distanceMeters: CLLocationDistance {
         let points = coordinates
@@ -240,4 +239,48 @@ extension Track {
         }
         return nil
     }
+
+    /// Earliest GPS timestamp in the track, or `startedAt` when points have no time.
+    var firstPointDate: Date {
+        coordinates.compactMap(\.timestamp).min() ?? startedAt
+    }
+}
+
+enum TrackNameFormatter {
+    /// Leading `001_` / `008_` style prefix from export filenames.
+    static func numericPrefix(in name: String) -> String? {
+        guard let end = name.firstIndex(of: "_") else { return nil }
+        let prefix = name[..<end]
+        guard !prefix.isEmpty, prefix.allSatisfy(\.isNumber) else { return nil }
+        return String(name[..<name.index(after: end)])
+    }
+
+    static func displayName(for storedName: String) -> String {
+        guard let prefix = numericPrefix(in: storedName) else { return storedName }
+        return String(storedName.dropFirst(prefix.count))
+    }
+
+    static func storedName(fromDisplayName displayName: String, preservingPrefixIn originalName: String) -> String {
+        guard let prefix = numericPrefix(in: originalName) else { return displayName }
+        return prefix + displayName
+    }
+
+    static func sortedByFirstPointDate(_ tracks: [Track]) -> [Track] {
+        tracks.sorted { lhs, rhs in
+            lhs.firstPointDate > rhs.firstPointDate
+        }
+    }
+
+    /// Example: `12 Jun 2026 at 23-10`
+    static func importedTrackName(from date: Date) -> String {
+        importedTrackNameFormatter.string(from: date)
+    }
+
+    private static let importedTrackNameFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .autoupdatingCurrent
+        formatter.dateFormat = "dd MMM yyyy 'at' HH-mm"
+        return formatter
+    }()
 }
