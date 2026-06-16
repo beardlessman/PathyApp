@@ -97,6 +97,18 @@ enum TrackPostProcessor {
         return result
     }
 
+    /// Applies filter parameters from Settings; ignores the master toggle when `forceEnabled` is true.
+    static func processWithStoredSettings(
+        _ coordinates: [TrackCoordinate],
+        forceEnabled: Bool = false
+    ) -> [TrackCoordinate] {
+        var settings = TrackProcessingSettingsStore.load()
+        if forceEnabled {
+            settings.isEnabled = true
+        }
+        return process(coordinates, settings: settings)
+    }
+
     // MARK: - Moving average
 
     private static func movingAverage(_ points: [TrackCoordinate], windowSize: Int) -> [TrackCoordinate] {

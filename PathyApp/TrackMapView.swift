@@ -16,6 +16,7 @@ struct TrackMapView: UIViewRepresentable {
     }
 
     var routes: [Route]
+    var highlightedRouteIDs: Set<String> = []
     var focusedRouteID: String?
     var followUserLocation = false
     var onMapReady: ((MKMapView, OfflineTileOverlay) -> Void)?
@@ -57,15 +58,25 @@ struct TrackMapView: UIViewRepresentable {
                 )
             }
             .filter { $0.coordinates.count > 1 }
+            .sorted { lhs, rhs in
+                let lhsHighlighted = highlightedRouteIDs.contains(lhs.id)
+                let rhsHighlighted = highlightedRouteIDs.contains(rhs.id)
+                if lhsHighlighted != rhsHighlighted {
+                    return !lhsHighlighted
+                }
+                return false
+            }
 
+        let highlightSignature = highlightedRouteIDs.sorted().joined(separator: ",")
         let tracksSignature = drawableRoutes
             .map { route in
                 let first = route.coordinates.first
                 let last = route.coordinates.last
                 let color = route.color.rgbaSignature
-                return "\(route.id):\(route.coordinates.count):\(first?.latitude ?? 0),\(first?.longitude ?? 0):\(last?.latitude ?? 0),\(last?.longitude ?? 0):\(color)"
+                let highlighted = highlightedRouteIDs.contains(route.id) ? "1" : "0"
+                return "\(route.id):\(route.coordinates.count):\(first?.latitude ?? 0),\(first?.longitude ?? 0):\(last?.latitude ?? 0),\(last?.longitude ?? 0):\(color):\(highlighted)"
             }
-            .joined(separator: "|")
+            .joined(separator: "|") + "#\(highlightSignature)"
 
         if context.coordinator.lastTracksSignature != tracksSignature {
             mapView.removeOverlays(context.coordinator.trackPolylines)

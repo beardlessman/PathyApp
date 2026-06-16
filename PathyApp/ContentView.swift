@@ -25,6 +25,7 @@ struct ContentView: View {
     @State private var isImporting = false
     @State private var isImportingTrack = false
     @State private var isDeletingTracks = false
+    @State private var postProcessingTrackID: UUID?
     @State private var exportedURL: URL?
     @State private var exportError: String?
     @State private var editingTrackID: UUID?
@@ -33,7 +34,11 @@ struct ContentView: View {
     @State private var shouldFollowUserOnMap = true
 
     private var isBusy: Bool {
-        isImportingTrack || isDeletingTracks
+        isImportingTrack || isDeletingTracks || postProcessingTrackID != nil || tracker.isPostProcessingTrack
+    }
+
+    private var isProcessingTrack: Bool {
+        postProcessingTrackID != nil || tracker.isPostProcessingTrack
     }
 
     private var displayedTrackRoutes: [TrackMapView.Route] {
@@ -55,6 +60,14 @@ struct ContentView: View {
                 strokeColor: state == .highlighted ? .systemOrange : .systemBlue
             )
         }
+    }
+
+    private var highlightedRouteIDs: Set<String> {
+        Set(
+            tracks.compactMap { track in
+                (trackDisplayStates[track.id] ?? .normal) == .highlighted ? track.id.uuidString : nil
+            }
+        )
     }
 
     private var focusedRouteID: String? {
@@ -79,6 +92,7 @@ struct ContentView: View {
         ZStack {
             TrackMapView(
                 routes: displayedTrackRoutes,
+                highlightedRouteIDs: highlightedRouteIDs,
                 focusedRouteID: focusedRouteID,
                 followUserLocation: tracker.isTracking && shouldFollowUserOnMap
             ) { map, overlay in
@@ -215,8 +229,22 @@ struct ContentView: View {
                         commitTrackNameEdit(for: track)
                     }
                 }
+                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                    Button(role: .destructive) {
+                        deleteTrack(track)
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+
+                    Button {
+                        postProcessTrack(track)
+                    } label: {
+                        Label("Process", systemImage: "bolt.fill")
+                    }
+                    .tint(.orange)
+                    .disabled(postProcessingTrackID != nil || track.coordinates.count < 2)
+                }
             }
-            .onDelete(perform: deleteTracks)
         }
         .frame(height: 180)
         .disabled(isBusy)
@@ -328,7 +356,11 @@ struct ContentView: View {
                 if isBusy {
                     ZStack {
                         Color.black.opacity(0.2).ignoresSafeArea()
-                        ProgressView(isDeletingTracks ? "Deleting track..." : "Importing GPX...")
+                        ProgressView(
+                            isProcessingTrack
+                                ? "Processing track..."
+                                : (isDeletingTracks ? "Deleting track..." : "Importing GPX...")
+                        )
                             .padding(.horizontal, 20)
                             .padding(.vertical, 14)
                             .background(.ultraThinMaterial)
@@ -415,26 +447,47 @@ struct ContentView: View {
         syncSelectionWithTracks()
     }
 
-    private func deleteTracks(at offsets: IndexSet) {
-        let tracksToDelete = offsets.map { tracks[$0] }
+    private func deleteTrack(_ track: Track) {
         isDeletingTracks = true
-
-        Task {
+        Task { @MainActor in
+            defer { isDeletingTracks = false }
             do {
-                for track in tracksToDelete {
-                    trackDisplayStates.removeValue(forKey: track.id)
-                    knownTrackIDs.remove(track.id)
-                    modelContext.delete(track)
-                }
+                trackDisplayStates.removeValue(forKey: track.id)
+                knownTrackIDs.remove(track.id)
+                modelContext.delete(track)
                 try modelContext.save()
-                let deletedIDs = Set(tracksToDelete.map(\.id))
-                tracks.removeAll { deletedIDs.contains($0.id) }
+                tracks.removeAll { $0.id == track.id }
                 refreshTracks()
                 syncSelectionWithTracks()
             } catch {
                 exportError = "Unable to delete track: \(error.localizedDescription)"
             }
-            isDeletingTracks = false
+        }
+    }
+
+    private func postProcessTrack(_ track: Track) {
+        guard postProcessingTrackID == nil else { return }
+        let rawCoordinates = track.coordinates
+        guard rawCoordinates.count >= 2 else {
+            exportError = "Track has too few points to process."
+            return
+        }
+
+        postProcessingTrackID = track.id
+        Task { @MainActor in
+            defer { postProcessingTrackID = nil }
+            let rawCount = rawCoordinates.count
+            let processed = await Task.detached(priority: .userInitiated) {
+                TrackPostProcessor.processWithStoredSettings(rawCoordinates, forceEnabled: true)
+            }.value
+
+            track.replaceCoordinates(processed)
+            do {
+                try modelContext.save()
+                upsertLocalTrack(track)
+            } catch {
+                exportError = "Unable to save processed track: \(error.localizedDescription)"
+            }
         }
     }
 

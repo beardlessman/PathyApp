@@ -130,6 +130,9 @@ final class LocationTracker: NSObject, ObservableObject {
     private let autoStartEnabledKey = "autoStartEnabled"
     /// Persisted alongside active track ID so restore knows whether to suppress automotive fixes.
     private let activeTrackingSessionAutoStartedKey = "activeTrackingSessionAutoStarted"
+    /// Unfinished post-process after stop (survives process kill); cleared after successful save.
+    private let pendingPostProcessTrackIDKey = "pendingPostProcessTrackID"
+    private let pendingPostProcessRawPointCountKey = "pendingPostProcessRawPointCount"
 
     /// True when recording was initiated by passive auto-start (not Start button); used to skip automotive segments.
     private var currentSessionStartedFromAutoTrigger = false
@@ -167,6 +170,7 @@ final class LocationTracker: NSObject, ObservableObject {
         restoreActiveTrackingIfNeeded()
         restorePassiveMonitoringIfNeeded()
         maintainPassiveRestPointIfNeeded(trigger: "model context attached")
+        resumePendingPostProcessingIfNeeded()
     }
 
     func requestPermissions() {
@@ -189,6 +193,7 @@ final class LocationTracker: NSObject, ObservableObject {
 
     func handleAppBecameActive() {
         maintainPassiveRestPointIfNeeded(trigger: "app became active")
+        resumePendingPostProcessingIfNeeded()
     }
 
     func beginBackgroundBridgeForLocationHandoff() {
@@ -298,8 +303,15 @@ final class LocationTracker: NSObject, ObservableObject {
         runPostProcessingIfNeeded(track: finishedTrack, rawCoordinates: rawCoordinates)
     }
 
-    private func runPostProcessingIfNeeded(track: Track?, rawCoordinates: [TrackCoordinate]) {
-        guard let modelContext else { return }
+    private func runPostProcessingIfNeeded(
+        track: Track?,
+        rawCoordinates: [TrackCoordinate],
+        trigger: String = "stop"
+    ) {
+        guard let modelContext else {
+            logDebugEvent("post-process skipped: no model context")
+            return
+        }
 
         guard let track else {
             runPersistenceBackgroundTask {
@@ -309,28 +321,115 @@ final class LocationTracker: NSObject, ObservableObject {
         }
 
         let settings = TrackProcessingSettingsStore.load()
-        guard settings.isEnabled, rawCoordinates.count >= 2 else {
+        guard settings.isEnabled else {
+            logDebugEvent("post-process skipped: disabled")
+            clearPendingPostProcessing()
             runPersistenceBackgroundTask {
                 try? modelContext.save()
             }
             return
         }
 
-        isPostProcessingTrack = true
-        let rawCount = rawCoordinates.count
-        Task {
-            let processed = await Task.detached(priority: .userInitiated) {
-                TrackPostProcessor.process(rawCoordinates, settings: settings)
-            }.value
-
-            track.replaceCoordinates(processed)
-            liveTrackCoordinates = processed
-            isPostProcessingTrack = false
-            logDebugEvent("post-process: \(rawCount) → \(processed.count) pts")
+        guard rawCoordinates.count >= 2 else {
+            logDebugEvent("post-process skipped: too few points (\(rawCoordinates.count))")
+            clearPendingPostProcessing()
             runPersistenceBackgroundTask {
                 try? modelContext.save()
             }
+            return
         }
+
+        guard !isPostProcessingTrack else {
+            logDebugEvent("post-process skipped: already running")
+            return
+        }
+
+        markPendingPostProcessing(trackID: track.id, rawPointCount: rawCoordinates.count)
+        isPostProcessingTrack = true
+        let rawCount = rawCoordinates.count
+        let trackID = track.id
+        logDebugEvent("post-process started (\(trigger)): \(rawCount) pts")
+
+        Task {
+            var backgroundTaskID = UIBackgroundTaskIdentifier.invalid
+            backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "pathy.track-post-process") { [weak self] in
+                Task { @MainActor in
+                    self?.logDebugEvent("post-process: background time expired")
+                }
+            }
+
+            defer {
+                if backgroundTaskID != .invalid {
+                    UIApplication.shared.endBackgroundTask(backgroundTaskID)
+                    backgroundTaskID = .invalid
+                }
+            }
+
+            let processed = await Task.detached(priority: .userInitiated) {
+                TrackPostProcessor.processWithStoredSettings(rawCoordinates)
+            }.value
+
+            track.replaceCoordinates(processed)
+            if currentTrack?.id == trackID {
+                liveTrackCoordinates = processed
+            }
+
+            do {
+                try modelContext.save()
+                clearPendingPostProcessing()
+                logDebugEvent("post-process: \(rawCount) → \(processed.count) pts")
+            } catch {
+                logDebugEvent("post-process save failed: \(error.localizedDescription)")
+            }
+
+            isPostProcessingTrack = false
+        }
+    }
+
+    private func markPendingPostProcessing(trackID: UUID, rawPointCount: Int) {
+        UserDefaults.standard.set(trackID.uuidString, forKey: pendingPostProcessTrackIDKey)
+        UserDefaults.standard.set(rawPointCount, forKey: pendingPostProcessRawPointCountKey)
+    }
+
+    private func clearPendingPostProcessing() {
+        UserDefaults.standard.removeObject(forKey: pendingPostProcessTrackIDKey)
+        UserDefaults.standard.removeObject(forKey: pendingPostProcessRawPointCountKey)
+    }
+
+    private func resumePendingPostProcessingIfNeeded() {
+        guard let modelContext, !isTracking, !isPostProcessingTrack else { return }
+        guard let idString = UserDefaults.standard.string(forKey: pendingPostProcessTrackIDKey),
+              let trackID = UUID(uuidString: idString) else {
+            return
+        }
+
+        let expectedRawCount = UserDefaults.standard.integer(forKey: pendingPostProcessRawPointCountKey)
+        guard expectedRawCount >= 2 else {
+            clearPendingPostProcessing()
+            return
+        }
+
+        let descriptor = FetchDescriptor<Track>(
+            predicate: #Predicate<Track> { track in
+                track.id == trackID
+            }
+        )
+        guard let track = try? modelContext.fetch(descriptor).first else {
+            logDebugEvent("post-process resume: track not found")
+            clearPendingPostProcessing()
+            return
+        }
+
+        guard track.pointCount == expectedRawCount else {
+            logDebugEvent(
+                "post-process resume: point count changed (\(track.pointCount) vs \(expectedRawCount)), skipping"
+            )
+            clearPendingPostProcessing()
+            return
+        }
+
+        logDebugEvent("post-process resume: retrying")
+        runPostProcessingIfNeeded(track: track, rawCoordinates: track.coordinates, trigger: "resume")
     }
 
     func pauseTracking() {
