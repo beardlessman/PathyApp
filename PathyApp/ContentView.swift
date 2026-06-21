@@ -16,6 +16,7 @@ struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var tracker: LocationTracker
+    @StateObject private var exploredHexStore = ExploredHexStore()
     @State private var tracks: [Track] = []
 
     @State private var trackDisplayStates: [UUID: TrackDisplayState] = [:]
@@ -262,48 +263,60 @@ struct ContentView: View {
         }
     }
 
+    @ViewBuilder
+    private var mainTracksView: some View {
+        VStack(spacing: isMapExpanded ? 0 : 12) {
+            mapAndControlsSection
+                .frame(maxHeight: .infinity)
+
+            if !isMapExpanded {
+                collapsedMapChrome
+            }
+        }
+        .padding(isMapExpanded ? 0 : 16)
+        .navigationTitle("Pathy")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                NavigationLink {
+                    SettingsView(
+                        tracker: tracker,
+                        isAutoStartEnabled: tracker.isAutoStartEnabled,
+                        setAutoStartEnabled: { tracker.setAutoStartEnabled($0) },
+                        onImportGPX: { isImporting = true },
+                        onExportGPX: exportAllTracks,
+                        canExportGPX: !tracks.isEmpty,
+                        isBusy: isBusy,
+                        savedTracksApproximateByteCount: approximateSavedTracksTotalBytes,
+                        onDeleteAllTracks: deleteAllTracks,
+                        canBulkDeleteAllTracks: !tracks.isEmpty && !tracker.isTracking,
+                        trackingBlocksBulkDeleteAll: tracker.isTracking && !tracks.isEmpty
+                    )
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+            }
+        }
+        .toolbar(isMapExpanded ? .hidden : .automatic, for: .navigationBar)
+    }
+
     var body: some View {
         NavigationStack {
-            VStack(spacing: isMapExpanded ? 0 : 12) {
-                mapAndControlsSection
-                    .frame(maxHeight: .infinity)
-
-                if !isMapExpanded {
-                    collapsedMapChrome
-                }
-            }
-            .padding(isMapExpanded ? 0 : 16)
-            .navigationTitle("Pathy")
-            .navigationBarTitleDisplayMode(.inline)
+            DiscoveryMapScreen(
+                exploredHexStore: exploredHexStore,
+                initialRegion: nil
+            )
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    NavigationLink {
-                        DebugDashboardView(tracker: tracker)
-                    } label: {
-                        Image(systemName: "ladybug")
-                    }
-                }
-
                 ToolbarItem(placement: .topBarTrailing) {
                     NavigationLink {
-                        SettingsView(
-                            isAutoStartEnabled: tracker.isAutoStartEnabled,
-                            setAutoStartEnabled: { tracker.setAutoStartEnabled($0) },
-                            onImportGPX: { isImporting = true },
-                            onExportGPX: exportAllTracks,
-                            canExportGPX: !tracks.isEmpty,
-                            isBusy: isBusy,
-                            savedTracksApproximateByteCount: approximateSavedTracksTotalBytes,
-                            onDeleteAllTracks: deleteAllTracks,
-                            canBulkDeleteAllTracks: !tracks.isEmpty && !tracker.isTracking,
-                            trackingBlocksBulkDeleteAll: tracker.isTracking && !tracks.isEmpty
-                        )
+                        mainTracksView
                     } label: {
-                        Image(systemName: "gearshape")
+                        Image(systemName: "map.fill")
                     }
+                    .accessibilityLabel("Треки")
                 }
             }
-            .toolbar(isMapExpanded ? .hidden : .automatic, for: .navigationBar)
+        }
             .fileImporter(
                 isPresented: $isImporting,
                 allowedContentTypes: [.xml, .gpx],
@@ -331,11 +344,14 @@ struct ContentView: View {
             })
             .onAppear {
                 tracker.attach(modelContext: modelContext)
+                exploredHexStore.attach(modelContext: modelContext)
                 tracker.requestPermissions()
                 tracker.onCoordinateRecorded = { coordinate in
                     autoCacheAroundTrackingCoordinate(coordinate)
+                    exploredHexStore.indexCoordinate(coordinate, throttle: true)
                 }
                 refreshTracks()
+                exploredHexStore.backfillFromTracksIfNeeded()
                 syncSelectionWithTracks()
             }
             .onChange(of: scenePhase) { _, newPhase in
@@ -344,10 +360,15 @@ struct ContentView: View {
                     refreshTracks()
                 }
             }
+            .onChange(of: tracker.isTracking) { wasTracking, isTracking in
+                guard wasTracking, !isTracking else { return }
+                exploredHexStore.indexCoordinates(tracker.liveTrackCoordinates)
+            }
             .onChange(of: tracker.isPostProcessingTrack) { _, isProcessing in
                 guard !isProcessing else { return }
                 if let currentTrack = tracker.currentTrack {
                     upsertLocalTrack(currentTrack)
+                    exploredHexStore.indexCoordinates(currentTrack.coordinates)
                 }
                 refreshTracks()
             }
@@ -368,7 +389,6 @@ struct ContentView: View {
                     }
                 }
             }
-        }
     }
 
     private func importTracks(urls: [URL]) {
@@ -392,12 +412,14 @@ struct ContentView: View {
                 let imported = try GPXService.importTracks(from: urls, modelContext: modelContext)
                 for track in imported {
                     upsertLocalTrack(track)
+                    exploredHexStore.indexCoordinates(track.coordinates)
                 }
                 refreshTracks()
                 syncSelectionWithTracks()
             } catch let batchError as GPXBatchImportError {
                 for track in batchError.partiallyImported {
                     upsertLocalTrack(track)
+                    exploredHexStore.indexCoordinates(track.coordinates)
                 }
                 refreshTracks()
                 syncSelectionWithTracks()
@@ -485,6 +507,7 @@ struct ContentView: View {
             do {
                 try modelContext.save()
                 upsertLocalTrack(track)
+                exploredHexStore.indexCoordinates(processed)
             } catch {
                 exportError = "Unable to save processed track: \(error.localizedDescription)"
             }
@@ -871,6 +894,7 @@ private extension DateFormatter {
 }
 
 private struct SettingsView: View {
+    let tracker: LocationTracker
     let isAutoStartEnabled: Bool
     let setAutoStartEnabled: (Bool) -> Void
     let onImportGPX: () -> Void
@@ -1003,6 +1027,14 @@ private struct SettingsView: View {
 
                 Button("Export GPX", action: onExportGPX)
                     .disabled(isBusy || !canExportGPX)
+            }
+
+            Section {
+                NavigationLink {
+                    DebugDashboardView(tracker: tracker)
+                } label: {
+                    Label("Debug", systemImage: "ladybug")
+                }
             }
         }
         .navigationTitle("Settings")

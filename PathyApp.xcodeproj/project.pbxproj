@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		F0A100012FA20000006C970F /* SwiftyH3 in Frameworks */ = {isa = PBXBuildFile; productRef = F0A100032FA20000006C970F /* SwiftyH3 */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		6E3773762FA11C3A006C970F /* PathyApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PathyApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -23,6 +27,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F0A100012FA20000006C970F /* SwiftyH3 in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -65,6 +70,7 @@
 			);
 			name = PathyApp;
 			packageProductDependencies = (
+				F0A100032FA20000006C970F /* SwiftyH3 */,
 			);
 			productName = PathyApp;
 			productReference = 6E3773762FA11C3A006C970F /* PathyApp.app */;
@@ -94,6 +100,9 @@
 			);
 			mainGroup = 6E37736D2FA11C3A006C970F;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				F0A100022FA20000006C970F /* XCRemoteSwiftPackageReference "SwiftyH3" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 6E3773772FA11C3A006C970F /* Products */;
 			projectDirPath = "";
@@ -256,9 +265,9 @@
 				DEVELOPMENT_TEAM = Q7YH32RCVW;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = PathyApp-Info.plist;
-				INFOPLIST_KEY_NSLocationAlwaysUsageDescription = "Pathy records your routes in background, even when screen is off.";
+				INFOPLIST_FILE = "PathyApp-Info.plist";
 				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Pathy records your routes in foreground and background.";
+				INFOPLIST_KEY_NSLocationAlwaysUsageDescription = "Pathy records your routes in background, even when screen is off.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Pathy needs your location to record tracks.";
 				INFOPLIST_KEY_NSMotionUsageDescription = "Pathy uses motion activity to auto-start walking tracks only.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -293,9 +302,9 @@
 				DEVELOPMENT_TEAM = Q7YH32RCVW;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = PathyApp-Info.plist;
-				INFOPLIST_KEY_NSLocationAlwaysUsageDescription = "Pathy records your routes in background, even when screen is off.";
+				INFOPLIST_FILE = "PathyApp-Info.plist";
 				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Pathy records your routes in foreground and background.";
+				INFOPLIST_KEY_NSLocationAlwaysUsageDescription = "Pathy records your routes in background, even when screen is off.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Pathy needs your location to record tracks.";
 				INFOPLIST_KEY_NSMotionUsageDescription = "Pathy uses motion activity to auto-start walking tracks only.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -342,6 +351,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		F0A100022FA20000006C970F /* XCRemoteSwiftPackageReference "SwiftyH3" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/pawelmajcher/SwiftyH3.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.5.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		F0A100032FA20000006C970F /* SwiftyH3 */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = F0A100022FA20000006C970F /* XCRemoteSwiftPackageReference "SwiftyH3" */;
+			productName = SwiftyH3;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 6E37736E2FA11C3A006C970F /* Project object */;
 }

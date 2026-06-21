@@ -34,7 +34,7 @@ struct TrackMapView: UIViewRepresentable {
 
         let overlay = OfflineTileOverlay(urlTemplate: nil)
         mapView.addOverlay(overlay, level: .aboveRoads)
-        context.coordinator.overlay = overlay
+        context.coordinator.baseTileOverlay = overlay
         onMapReady?(mapView, overlay)
         return mapView
     }
@@ -90,7 +90,9 @@ struct TrackMapView: UIViewRepresentable {
                 return polyline
             }
             context.coordinator.trackPolylines = polylines
-            mapView.addOverlays(polylines, level: .aboveLabels)
+            if !polylines.isEmpty {
+                mapView.addOverlays(polylines, level: .aboveLabels)
+            }
             context.coordinator.lastTracksSignature = tracksSignature
         }
 
@@ -113,7 +115,7 @@ struct TrackMapView: UIViewRepresentable {
     }
 
     final class Coordinator: NSObject, MKMapViewDelegate {
-        var overlay: OfflineTileOverlay?
+        var baseTileOverlay: OfflineTileOverlay?
         var trackPolylines: [MKPolyline] = []
         var polylineColors: [ObjectIdentifier: UIColor] = [:]
         var polylineRouteIDs: [ObjectIdentifier: String] = [:]
