@@ -154,6 +154,8 @@ private enum FogTileRenderer {
     private static let tileSize = 256
     private static let fogColor = UIColor(white: 0.15, alpha: 0.75)
     private static let borderColor = UIColor.black.withAlphaComponent(0.6)
+    /// Fraction of each edge used for Bézier corner rounding (0.5 caps at a circle).
+    private static let cornerRadiusPercent: CGFloat = 0.35
 
     static func renderTile(
         z: Int,
@@ -177,7 +179,7 @@ private enum FogTileRenderer {
             let vertices = exploredHex.boundary.map {
                 pixelPoint(latitude: $0.latitude, longitude: $0.longitude, z: z, x: x, y: y)
             }
-            return roundedHexPath(vertices: vertices, cornerRadiusPercent: 0.2)
+            return roundedHexPath(vertices: vertices, cornerRadiusPercent: cornerRadiusPercent)
         }
 
         let image = renderer.image { context in

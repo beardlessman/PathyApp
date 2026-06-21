@@ -9,6 +9,8 @@ import Foundation
 import SwiftData
 
 final class ExploredHexStore: ObservableObject {
+    private static let storedResolutionKey = "exploredHexH3Resolution"
+
     @Published private(set) var revision = 0
 
     private let lock = NSLock()
@@ -33,6 +35,7 @@ final class ExploredHexStore: ObservableObject {
     @MainActor
     func attach(modelContext: ModelContext) {
         self.modelContext = modelContext
+        migrateResolutionIfNeeded()
         reloadCache()
     }
 
@@ -49,8 +52,9 @@ final class ExploredHexStore: ObservableObject {
         }
 
         Task { @MainActor in
-            await indexCoordinates(tracks.flatMap(\.coordinates), persistBatchSize: 500)
+            indexCoordinates(tracks.flatMap(\.coordinates), persistBatchSize: 500)
             defaults.set(true, forKey: "didBackfillExploredHexes")
+            markStoredResolutionCurrent()
         }
     }
 
@@ -72,7 +76,7 @@ final class ExploredHexStore: ObservableObject {
     @MainActor
     func indexCoordinates(_ coordinates: [TrackCoordinate]) {
         Task { @MainActor in
-            await indexCoordinates(coordinates, persistBatchSize: 200)
+            indexCoordinates(coordinates, persistBatchSize: 200)
         }
     }
 
@@ -113,6 +117,7 @@ final class ExploredHexStore: ObservableObject {
         let descriptor = FetchDescriptor<ExploredHex>()
         let stored = (try? modelContext.fetch(descriptor)) ?? []
         let entries = stored.compactMap { explored -> ExploredHexCacheEntry? in
+            guard H3Indexing.isHexIdAtCurrentResolution(explored.hexId) else { return nil }
             guard let boundary = H3Indexing.boundaryCoordinates(for: explored.hexId), boundary.count >= 3 else {
                 return nil
             }
@@ -166,7 +171,41 @@ final class ExploredHexStore: ObservableObject {
     }
 
     @MainActor
-    private func indexCoordinates(_ coordinates: [TrackCoordinate], persistBatchSize: Int) async {
+    private func migrateResolutionIfNeeded() {
+        guard let modelContext else { return }
+
+        let defaults = UserDefaults.standard
+        let storedResolution = defaults.integer(forKey: Self.storedResolutionKey)
+        let currentResolution = H3Indexing.resolutionValue
+
+        guard storedResolution != currentResolution else { return }
+
+        let existing = (try? modelContext.fetch(FetchDescriptor<ExploredHex>())) ?? []
+        if !existing.isEmpty {
+            for hex in existing {
+                modelContext.delete(hex)
+            }
+            try? modelContext.save()
+
+            lock.lock()
+            cache = []
+            knownHexIDs = []
+            lock.unlock()
+
+            let tracks = (try? modelContext.fetch(FetchDescriptor<Track>())) ?? []
+            indexCoordinates(tracks.flatMap(\.coordinates), persistBatchSize: 500)
+        }
+
+        markStoredResolutionCurrent()
+        revision &+= 1
+    }
+
+    private func markStoredResolutionCurrent() {
+        UserDefaults.standard.set(H3Indexing.resolutionValue, forKey: Self.storedResolutionKey)
+    }
+
+    @MainActor
+    private func indexCoordinates(_ coordinates: [TrackCoordinate], persistBatchSize: Int) {
         guard let modelContext else { return }
 
         var insertedSinceSave = 0

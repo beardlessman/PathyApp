@@ -33,6 +33,7 @@ struct ContentView: View {
     @State private var editingTrackName = ""
     @State private var isMapExpanded = false
     @State private var shouldFollowUserOnMap = true
+    @State private var showTracksScreen = false
 
     private var isBusy: Bool {
         isImportingTrack || isDeletingTracks || postProcessingTrackID != nil || tracker.isPostProcessingTrack
@@ -304,18 +305,13 @@ struct ContentView: View {
         NavigationStack {
             DiscoveryMapScreen(
                 exploredHexStore: exploredHexStore,
-                initialRegion: nil
+                initialRegion: nil,
+                onOpenTracks: { showTracksScreen = true }
             )
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    NavigationLink {
-                        mainTracksView
-                    } label: {
-                        Image(systemName: "map.fill")
-                    }
-                    .accessibilityLabel("Треки")
-                }
+            .navigationDestination(isPresented: $showTracksScreen) {
+                mainTracksView
             }
+            .toolbar(.hidden, for: .navigationBar)
         }
             .fileImporter(
                 isPresented: $isImporting,

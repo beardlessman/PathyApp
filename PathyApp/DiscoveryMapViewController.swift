@@ -18,11 +18,15 @@ final class DiscoveryMapViewController: UIViewController {
     private var fogOverlay: FogOfWarTileOverlay?
     private var compassButton: MKCompassButton?
     private var trackingButton: DiscoveryUserTrackingButton?
+    private var tracksButton: DiscoveryRoundMapButton?
+    private var mapControlsStack: UIStackView?
     private var revisionCancellable: AnyCancellable?
     private var lastFogRevision = -1
     private var pendingFogRevision: Int?
     private var shouldCenterOnUser = true
     private let discoveryZoomMeters: CLLocationDistance = 500
+
+    var onOpenTracks: (() -> Void)?
 
     init(exploredHexStore: ExploredHexStore, initialRegion: MKCoordinateRegion?) {
         self.exploredHexStore = exploredHexStore
@@ -45,8 +49,12 @@ final class DiscoveryMapViewController: UIViewController {
         fogOverlay = nil
         compassButton?.removeFromSuperview()
         trackingButton?.removeFromSuperview()
+        tracksButton?.removeFromSuperview()
+        mapControlsStack?.removeFromSuperview()
         compassButton = nil
         trackingButton = nil
+        tracksButton = nil
+        mapControlsStack = nil
         mapView?.removeFromSuperview()
         mapView = nil
     }
@@ -110,25 +118,34 @@ final class DiscoveryMapViewController: UIViewController {
     }
 
     private func configureMapControls(mapView: MKMapView) {
+        let tracksButton = DiscoveryRoundMapButton(systemName: "list.bullet")
+        tracksButton.addTarget(self, action: #selector(openTracksTapped), for: .touchUpInside)
+        tracksButton.accessibilityLabel = "Треки"
+        self.tracksButton = tracksButton
+
         let trackingButton = DiscoveryUserTrackingButton(mapView: mapView)
-        trackingButton.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(trackingButton)
         self.trackingButton = trackingButton
 
         let compassButton = MKCompassButton(mapView: mapView)
         compassButton.compassVisibility = .adaptive
-        compassButton.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(compassButton)
         self.compassButton = compassButton
 
-        let controlsTopInset: CGFloat = 56
+        let controlsStack = UIStackView(arrangedSubviews: [tracksButton, trackingButton, compassButton])
+        controlsStack.axis = .vertical
+        controlsStack.alignment = .trailing
+        controlsStack.spacing = 8
+        controlsStack.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(controlsStack)
+        self.mapControlsStack = controlsStack
 
         NSLayoutConstraint.activate([
-            trackingButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: controlsTopInset),
-            trackingButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
-            compassButton.topAnchor.constraint(equalTo: trackingButton.bottomAnchor, constant: 8),
-            compassButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
+            controlsStack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
+            controlsStack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
         ])
+    }
+
+    @objc private func openTracksTapped() {
+        onOpenTracks?()
     }
 
     private func applyInitialViewport() {
@@ -219,20 +236,66 @@ extension DiscoveryMapViewController: MKMapViewDelegate {
     }
 }
 
+// MARK: - Map control buttons
+
+private class DiscoveryRoundMapButton: UIControl {
+    static let diameter: CGFloat = 44
+
+    private let iconView = UIImageView()
+    private let iconTint = UIColor(white: 0.12, alpha: 1)
+
+    init(systemName: String) {
+        super.init(frame: .zero)
+        configure(systemName: systemName)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func setSystemName(_ systemName: String) {
+        let configuration = UIImage.SymbolConfiguration(pointSize: 18, weight: .medium)
+        iconView.image = UIImage(systemName: systemName, withConfiguration: configuration)?
+            .withRenderingMode(.alwaysTemplate)
+    }
+
+    private func configure(systemName: String) {
+        translatesAutoresizingMaskIntoConstraints = false
+        backgroundColor = .white
+        layer.cornerRadius = Self.diameter / 2
+        layer.cornerCurve = .continuous
+        layer.shadowColor = UIColor.black.cgColor
+        layer.shadowOpacity = 0.18
+        layer.shadowRadius = 2
+        layer.shadowOffset = CGSize(width: 0, height: 1)
+
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.tintColor = iconTint
+        iconView.contentMode = .scaleAspectFit
+        addSubview(iconView)
+        setSystemName(systemName)
+
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: Self.diameter),
+            heightAnchor.constraint(equalToConstant: Self.diameter),
+            iconView.centerXAnchor.constraint(equalTo: centerXAnchor),
+            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 22),
+            iconView.heightAnchor.constraint(equalToConstant: 22),
+        ])
+    }
+}
+
 // MARK: - Custom user tracking button
 
 /// Outline SF Symbol styling with the same tracking-mode cycle as `MKUserTrackingButton`.
-private final class DiscoveryUserTrackingButton: UIControl {
+private final class DiscoveryUserTrackingButton: DiscoveryRoundMapButton {
     private weak var mapView: MKMapView?
-    private let iconView = UIImageView()
-
-    private let buttonSize: CGFloat = 44
-    private let iconTint = UIColor(white: 0.12, alpha: 1)
 
     init(mapView: MKMapView) {
         self.mapView = mapView
-        super.init(frame: .zero)
-        configure()
+        super.init(systemName: "location")
         syncAppearance(with: mapView.userTrackingMode)
         addTarget(self, action: #selector(handleTap), for: .touchUpInside)
     }
@@ -252,9 +315,7 @@ private final class DiscoveryUserTrackingButton: UIControl {
         @unknown default:
             symbolName = "location"
         }
-        let configuration = UIImage.SymbolConfiguration(pointSize: 18, weight: .medium)
-        iconView.image = UIImage(systemName: symbolName, withConfiguration: configuration)?
-            .withRenderingMode(.alwaysTemplate)
+        setSystemName(symbolName)
     }
 
     @objc private func handleTap() {
@@ -273,45 +334,24 @@ private final class DiscoveryUserTrackingButton: UIControl {
         mapView.setUserTrackingMode(nextMode, animated: true)
         syncAppearance(with: nextMode)
     }
-
-    private func configure() {
-        translatesAutoresizingMaskIntoConstraints = false
-        backgroundColor = .white
-        layer.cornerRadius = buttonSize / 2
-        layer.cornerCurve = .continuous
-        layer.shadowColor = UIColor.black.cgColor
-        layer.shadowOpacity = 0.18
-        layer.shadowRadius = 2
-        layer.shadowOffset = CGSize(width: 0, height: 1)
-
-        iconView.translatesAutoresizingMaskIntoConstraints = false
-        iconView.tintColor = iconTint
-        iconView.contentMode = .scaleAspectFit
-        addSubview(iconView)
-
-        NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: buttonSize),
-            heightAnchor.constraint(equalToConstant: buttonSize),
-            iconView.centerXAnchor.constraint(equalTo: centerXAnchor),
-            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
-            iconView.widthAnchor.constraint(equalToConstant: 22),
-            iconView.heightAnchor.constraint(equalToConstant: 22),
-        ])
-    }
 }
 
 struct DiscoveryMapViewControllerRepresentable: UIViewControllerRepresentable {
     @ObservedObject var exploredHexStore: ExploredHexStore
     let initialRegion: MKCoordinateRegion?
+    let onOpenTracks: () -> Void
 
     func makeUIViewController(context: Context) -> DiscoveryMapViewController {
-        DiscoveryMapViewController(
+        let controller = DiscoveryMapViewController(
             exploredHexStore: exploredHexStore,
             initialRegion: initialRegion
         )
+        controller.onOpenTracks = onOpenTracks
+        return controller
     }
 
     func updateUIViewController(_ uiViewController: DiscoveryMapViewController, context: Context) {
+        uiViewController.onOpenTracks = onOpenTracks
         uiViewController.updateFogRevision(exploredHexStore.revision)
     }
 }
@@ -319,11 +359,13 @@ struct DiscoveryMapViewControllerRepresentable: UIViewControllerRepresentable {
 struct DiscoveryMapScreen: View {
     @ObservedObject var exploredHexStore: ExploredHexStore
     let initialRegion: MKCoordinateRegion?
+    let onOpenTracks: () -> Void
 
     var body: some View {
         DiscoveryMapViewControllerRepresentable(
             exploredHexStore: exploredHexStore,
-            initialRegion: initialRegion
+            initialRegion: initialRegion,
+            onOpenTracks: onOpenTracks
         )
         .ignoresSafeArea()
     }

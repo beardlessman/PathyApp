@@ -24,9 +24,15 @@ final class ExploredHex {
 }
 
 enum H3Indexing {
-    static let resolution: H3Cell.Resolution = .res9
-    /// Approximate hex edge length at resolution 9 (~66 m).
-    static let boundsPaddingDegrees = 0.001
+    static let resolution: H3Cell.Resolution = .res10
+    static let resolutionValue = 10
+    /// Approximate hex edge length at resolution 10 (~66 m per Uber H3).
+    static let boundsPaddingDegrees = 0.0005
+
+    static func isHexIdAtCurrentResolution(_ hexId: String) -> Bool {
+        guard let cell = H3Cell(hexId), cell.isValid else { return false }
+        return (try? cell.resolution) == resolution
+    }
 
     static func hexId(latitude: Double, longitude: Double) -> String? {
         let latLng = H3LatLng(latitudeDegs: latitude, longitudeDegs: longitude)
