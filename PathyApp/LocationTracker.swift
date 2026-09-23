@@ -158,6 +158,8 @@ final class LocationTracker: NSObject, ObservableObject {
     private var autoStartVerificationTimeoutWorkItem: DispatchWorkItem?
     private var isPassiveRestLocationRequestActive = false
     private var passiveRestLocationRequestTimeoutWorkItem: DispatchWorkItem?
+    /// Geofence exit can arrive before SwiftUI attaches ModelContext — retry after attach.
+    private var pendingAutoStartVerification = false
 
     private override init() {
         super.init()
@@ -178,11 +180,15 @@ final class LocationTracker: NSObject, ObservableObject {
     }
 
     func attach(modelContext: ModelContext) {
+        let wasMissing = self.modelContext == nil
         self.modelContext = modelContext
         restoreActiveTrackingIfNeeded()
         restorePassiveMonitoringIfNeeded()
         maintainPassiveRestPointIfNeeded(trigger: "model context attached")
         resumePendingPostProcessingIfNeeded()
+        if wasMissing || pendingAutoStartVerification {
+            flushPendingAutoStartVerificationIfNeeded()
+        }
     }
 
     func requestPermissions() {
@@ -199,13 +205,23 @@ final class LocationTracker: NSObject, ObservableObject {
     }
 
     func handleDidFinishLaunching() {
+        // Attach store before restoring geofence so a queued region exit can start verification.
+        ensureModelContextAttachedFromPersistence()
         restorePassiveMonitoringIfNeeded()
         maintainPassiveRestPointIfNeeded(trigger: "app launch")
+        flushPendingAutoStartVerificationIfNeeded()
     }
 
     func handleAppBecameActive() {
+        ensureModelContextAttachedFromPersistence()
         maintainPassiveRestPointIfNeeded(trigger: "app became active")
         resumePendingPostProcessingIfNeeded()
+        flushPendingAutoStartVerificationIfNeeded()
+    }
+
+    private func ensureModelContextAttachedFromPersistence() {
+        guard modelContext == nil else { return }
+        attach(modelContext: PersistenceController.sharedContainer.mainContext)
     }
 
     func beginBackgroundBridgeForLocationHandoff() {
@@ -485,7 +501,9 @@ final class LocationTracker: NSObject, ObservableObject {
             restorePassiveMonitoringIfNeeded()
             maintainPassiveRestPointIfNeeded(trigger: "auto-start enabled")
             attemptPendingAutoStart()
+            flushPendingAutoStartVerificationIfNeeded()
         } else {
+            pendingAutoStartVerification = false
             cancelPassiveRestLocationRequest(reason: "auto-start disabled")
             pendingAutoStartLocation = nil
             cancelAutoStartVerificationIfActive(reason: "auto-start disabled")
@@ -1044,16 +1062,33 @@ final class LocationTracker: NSObject, ObservableObject {
 
     private func startAutoStartVerificationPhase() {
         cancelPassiveRestLocationRequest(reason: "auto-start verification")
-        guard isAutoStartEnabled else { return }
-        guard !isTracking else { return }
-        guard authorizationStatus == .authorizedAlways else { return }
-        guard modelContext != nil else {
-            logDebugEvent("auto-start verification skipped: no model context")
+        guard isAutoStartEnabled else {
+            pendingAutoStartVerification = false
             return
         }
-        guard loadRestLocation() != nil else { return }
-        guard !isAutoStartVerificationActive else { return }
+        guard !isTracking else {
+            pendingAutoStartVerification = false
+            return
+        }
+        guard authorizationStatus == .authorizedAlways else {
+            pendingAutoStartVerification = false
+            return
+        }
+        guard modelContext != nil else {
+            pendingAutoStartVerification = true
+            logDebugEvent("auto-start verification deferred: no model context")
+            return
+        }
+        guard loadRestLocation() != nil else {
+            pendingAutoStartVerification = false
+            return
+        }
+        guard !isAutoStartVerificationActive else {
+            pendingAutoStartVerification = false
+            return
+        }
 
+        pendingAutoStartVerification = false
         isAutoStartVerificationActive = true
         autoStartVerificationGoodSamples = 0
         lastPassiveTriggerLocation = nil
@@ -1071,6 +1106,13 @@ final class LocationTracker: NSObject, ObservableObject {
         applyAutoStartVerificationLocationConfig()
         locationManager.startUpdatingLocation()
         logDebugEvent("auto-start verification: high accuracy on")
+    }
+
+    private func flushPendingAutoStartVerificationIfNeeded() {
+        guard pendingAutoStartVerification else { return }
+        guard modelContext != nil else { return }
+        logDebugEvent("auto-start verification resuming after model context ready")
+        startAutoStartVerificationPhase()
     }
 
     private func applyAutoStartVerificationLocationConfig() {
