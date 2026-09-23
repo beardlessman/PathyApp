@@ -12,13 +12,20 @@ final class ExploredHexStore: ObservableObject {
     private static let storedResolutionKey = "exploredHexH3Resolution"
 
     @Published private(set) var revision = 0
+    @Published private(set) var isReindexing = false
 
     private let lock = NSLock()
     private var modelContext: ModelContext?
     private var cache: [ExploredHexCacheEntry] = []
     private var knownHexIDs: Set<String> = []
     private var lastIndexedAt: Date?
+    private var reindexTask: Task<Void, Never>?
     private let indexThrottle: TimeInterval = 5
+
+    private struct CoordinateSnapshot: Sendable {
+        let latitude: Double
+        let longitude: Double
+    }
 
     private struct ExploredHexCacheEntry: Sendable {
         let hexId: String
@@ -102,6 +109,99 @@ final class ExploredHexStore: ObservableObject {
         let explored = knownHexIDs.contains(hexId)
         lock.unlock()
         return explored
+    }
+
+    @MainActor
+    func reindexFromAllTracks() {
+        reindexTask?.cancel()
+        reindexTask = Task { @MainActor in
+            isReindexing = true
+            defer {
+                isReindexing = false
+                reindexTask = nil
+            }
+            await performReindexFromAllTracks()
+        }
+    }
+
+    @MainActor
+    private func performReindexFromAllTracks() async {
+        guard let modelContext else { return }
+
+        let existing = (try? modelContext.fetch(FetchDescriptor<ExploredHex>())) ?? []
+        for hex in existing {
+            modelContext.delete(hex)
+        }
+        try? modelContext.save()
+
+        lock.lock()
+        cache = []
+        knownHexIDs = []
+        lock.unlock()
+
+        guard !Task.isCancelled else { return }
+
+        let tracks = (try? modelContext.fetch(FetchDescriptor<Track>())) ?? []
+        guard !tracks.isEmpty else {
+            revision &+= 1
+            return
+        }
+
+        let coordinateSnapshots = tracks.flatMap(\.coordinates).map {
+            CoordinateSnapshot(latitude: $0.latitude, longitude: $0.longitude)
+        }
+
+        let uniqueHexIds = await Task.detached(priority: .utility) {
+            var hexIds = Set<String>()
+            hexIds.reserveCapacity(min(coordinateSnapshots.count / 8, 100_000))
+            for coordinate in coordinateSnapshots {
+                if let hexId = H3Indexing.hexId(
+                    latitude: coordinate.latitude,
+                    longitude: coordinate.longitude
+                ) {
+                    hexIds.insert(hexId)
+                }
+            }
+            return Array(hexIds)
+        }.value
+
+        guard !Task.isCancelled else { return }
+
+        let batchSize = 200
+        var insertedSinceSave = 0
+        for hexId in uniqueHexIds {
+            if Task.isCancelled { return }
+            guard let center = H3Indexing.centerCoordinate(for: hexId) else { continue }
+            guard let boundary = H3Indexing.boundaryCoordinates(for: hexId), boundary.count >= 3 else { continue }
+
+            let explored = ExploredHex(
+                hexId: hexId,
+                centerLatitude: center.latitude,
+                centerLongitude: center.longitude
+            )
+            modelContext.insert(explored)
+
+            let entry = ExploredHexCacheEntry(
+                hexId: hexId,
+                centerLatitude: center.latitude,
+                centerLongitude: center.longitude,
+                boundary: boundary
+            )
+            lock.lock()
+            knownHexIDs.insert(hexId)
+            cache.append(entry)
+            lock.unlock()
+
+            insertedSinceSave += 1
+            if insertedSinceSave.isMultiple(of: batchSize) {
+                try? modelContext.save()
+                revision &+= 1
+                await Task.yield()
+            }
+        }
+
+        try? modelContext.save()
+        revision &+= 1
     }
 
     @MainActor

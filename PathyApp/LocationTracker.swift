@@ -27,15 +27,10 @@ final class LocationTracker: NSObject, ObservableObject {
     @Published private(set) var debugEvents: [String] = []
     @Published private(set) var debugGeofenceActive = false
     @Published private(set) var debugRestCoordinate: CLLocationCoordinate2D?
+    @Published private(set) var debugRestCreatedAt: Date?
     @Published private(set) var debugDistanceToRest: CLLocationDistance?
     @Published private(set) var debugLastSignificantMovementAt: Date?
     @Published private(set) var debugSecondsUntilAutoStop: TimeInterval?
-    @Published private(set) var debugMedianHorizontalAccuracy: Double?
-    @Published private(set) var debugPoorAccuracyShare: Double?
-    @Published private(set) var debugDesiredAccuracy: CLLocationAccuracy = 0
-    @Published private(set) var debugDistanceFilter: CLLocationDistance = 0
-    @Published private(set) var debugDeferredDistance: CLLocationDistance = 0
-    @Published private(set) var debugDeferredTimeout: TimeInterval = 0
     var onCoordinateRecorded: ((CLLocationCoordinate2D) -> Void)?
 
     private let locationManager = CLLocationManager()
@@ -53,9 +48,6 @@ final class LocationTracker: NSObject, ObservableObject {
     private var lastPassiveTriggerLocation: CLLocation?
     private var lastPassiveTriggerAt: Date?
     private var latestMotionActivity: CMMotionActivity?
-    private var pendingDebugLocationScan = false
-    private var recentHorizontalAccuracies: [Double] = []
-
     private let significantMovementThreshold: CLLocationDistance = 20
     private let maxWalkingAutoStartSpeed: CLLocationSpeed = 2.8
     /// Coarse wake: iOS geofence; Apple recommends ~100m minimum for reliable region events.
@@ -160,7 +152,6 @@ final class LocationTracker: NSObject, ObservableObject {
         }
         isAutoStartEnabled = defaults.bool(forKey: autoStartEnabledKey)
 
-        refreshDebugConfiguration()
         logDebugEvent("tracker initialized")
         startMotionActivityUpdatesIfAvailable()
     }
@@ -463,13 +454,6 @@ final class LocationTracker: NSObject, ObservableObject {
         flushCoordinates(forceSave: true)
     }
 
-    func requestDebugLocationScan() {
-        guard authorizationStatus == .authorizedAlways || authorizationStatus == .authorizedWhenInUse else { return }
-        pendingDebugLocationScan = true
-        logDebugEvent("debug location scan requested")
-        locationManager.requestLocation()
-    }
-
     func setAutoStartEnabled(_ enabled: Bool) {
         guard isAutoStartEnabled != enabled else { return }
 
@@ -507,7 +491,6 @@ final class LocationTracker: NSObject, ObservableObject {
         if appendFilter_shouldPersist {
             guard shouldPersistLocation(location) else {
                 updateDebugLocationSnapshot(location, source: "active")
-                updateGPSQuality(with: location.horizontalAccuracy)
                 evaluateAdaptiveAccuracy(with: location)
                 evaluateMovementState(with: location)
                 return
@@ -529,9 +512,6 @@ final class LocationTracker: NSObject, ObservableObject {
         liveTrackCoordinates = bufferedCoordinates
         onCoordinateRecorded?(location.coordinate)
         updateDebugLocationSnapshot(location, source: "active")
-        if location.horizontalAccuracy > 0 {
-            updateGPSQuality(with: location.horizontalAccuracy)
-        }
 
         evaluateAdaptiveAccuracy(with: location)
         evaluateMovementState(with: location)
@@ -770,6 +750,7 @@ final class LocationTracker: NSObject, ObservableObject {
 
     private func restoreRestGeofenceIfPossible() {
         guard let restLocation = loadRestLocation() else { return }
+        refreshRestDebugFields(from: restLocation)
         if CLLocationManager.isMonitoringAvailable(for: CLCircularRegion.self) {
             createRestGeofence(center: restLocation.coordinate)
         } else {
@@ -784,6 +765,9 @@ final class LocationTracker: NSObject, ObservableObject {
         let region = CLCircularRegion(center: center, radius: passiveWakeGeofenceRadius, identifier: passiveGeofenceIdentifier)
         debugGeofenceActive = true
         debugRestCoordinate = center
+        if let rest = loadRestLocation() {
+            refreshRestDebugFields(from: rest)
+        }
         logDebugEvent("rest geofence armed (\(Int(passiveWakeGeofenceRadius))m wake)")
         region.notifyOnEntry = true
         region.notifyOnExit = true
@@ -818,8 +802,14 @@ final class LocationTracker: NSObject, ObservableObject {
         defaults.set(location.coordinate.latitude, forKey: restLatitudeKey)
         defaults.set(location.coordinate.longitude, forKey: restLongitudeKey)
         defaults.set(location.timestamp.timeIntervalSince1970, forKey: restTimestampKey)
+        refreshRestDebugFields(from: location)
         createRestGeofence(center: location.coordinate)
         logDebugEvent("rest location persisted")
+    }
+
+    private func refreshRestDebugFields(from location: CLLocation) {
+        debugRestCoordinate = location.coordinate
+        debugRestCreatedAt = location.timestamp == .distantPast ? nil : location.timestamp
     }
 
     /// Seeds or relocates the passive rest anchor (no track) so auto-start stays valid after drives / travel.
@@ -1094,7 +1084,6 @@ final class LocationTracker: NSObject, ObservableObject {
         locationManager.distanceFilter = verificationDistanceFilter
         applyDesiredAccuracyIfNeeded(kCLLocationAccuracyBest)
         locationManager.activityType = .otherNavigation
-        refreshDebugConfiguration()
     }
 
     private func cancelAutoStartVerificationIfActive(reason: String) {
@@ -1106,7 +1095,6 @@ final class LocationTracker: NSObject, ObservableObject {
         locationManager.stopUpdatingLocation()
         locationManager.activityType = .fitness
         applyEconomyLocationConfig()
-        refreshDebugConfiguration()
         logDebugEvent("auto-start verification off (\(reason))")
     }
 
@@ -1159,7 +1147,6 @@ final class LocationTracker: NSObject, ObservableObject {
             locationManager.stopUpdatingLocation()
             locationManager.activityType = .fitness
             applyEconomyLocationConfig()
-            refreshDebugConfiguration()
             pendingAutoStartLocation = location
             attemptPendingAutoStart()
             return
@@ -1315,19 +1302,6 @@ final class LocationTracker: NSObject, ObservableObject {
         debugDistanceToRest = location.distance(from: rest)
     }
 
-    private func updateGPSQuality(with horizontalAccuracy: CLLocationAccuracy) {
-        recentHorizontalAccuracies.append(horizontalAccuracy)
-        if recentHorizontalAccuracies.count > 30 {
-            recentHorizontalAccuracies.removeFirst(recentHorizontalAccuracies.count - 30)
-        }
-        let sorted = recentHorizontalAccuracies.sorted()
-        if !sorted.isEmpty {
-            debugMedianHorizontalAccuracy = sorted[sorted.count / 2]
-            let poor = sorted.filter { $0 > 30 }.count
-            debugPoorAccuracyShare = Double(poor) / Double(sorted.count)
-        }
-    }
-
     private func updateStationaryDebugFields(now: Date) {
         guard let lastSignificantMovementAt else {
             debugSecondsUntilAutoStop = nil
@@ -1335,13 +1309,6 @@ final class LocationTracker: NSObject, ObservableObject {
         }
         let elapsed = now.timeIntervalSince(lastSignificantMovementAt)
         debugSecondsUntilAutoStop = max(0, stationaryTimeout - elapsed)
-    }
-
-    private func refreshDebugConfiguration() {
-        debugDesiredAccuracy = locationManager.desiredAccuracy
-        debugDistanceFilter = locationManager.distanceFilter
-        debugDeferredDistance = deferredDistance
-        debugDeferredTimeout = deferredTimeout
     }
 
     private func logDebugEvent(_ message: String) {
@@ -1459,7 +1426,6 @@ final class LocationTracker: NSObject, ObservableObject {
     private func applyDesiredAccuracyIfNeeded(_ accuracy: CLLocationAccuracy) {
         guard abs(locationManager.desiredAccuracy - accuracy) > 0.5 else { return }
         locationManager.desiredAccuracy = accuracy
-        debugDesiredAccuracy = accuracy
     }
 
     private func cancelScheduledReturnToEconomy() {
@@ -1496,7 +1462,6 @@ final class LocationTracker: NSObject, ObservableObject {
         locationManager.pausesLocationUpdatesAutomatically = true
         locationManager.distanceFilter = economyDistanceFilter
         applyDesiredAccuracyIfNeeded(economyAccuracy)
-        refreshDebugConfiguration()
     }
 
     private func applyActiveTrackingLocationConfig() {
@@ -1508,7 +1473,6 @@ final class LocationTracker: NSObject, ObservableObject {
             locationManager.showsBackgroundLocationIndicator = true
         }
         applyDesiredAccuracyIfNeeded(activeTrackingAccuracy)
-        refreshDebugConfiguration()
     }
 
     /// Prefer course from GPS when valid; otherwise movement vector from spaced samples.
@@ -1621,10 +1585,6 @@ extension LocationTracker: CLLocationManagerDelegate {
                 evaluateStationaryTimeout(now: Date())
                 armDeferredUpdates()
             }
-        } else if pendingDebugLocationScan, let latest = locations.last {
-            updateDebugLocationSnapshot(latest, source: "debug")
-            logDebugEvent("debug location scan success")
-            pendingDebugLocationScan = false
         } else if isPassiveRestLocationRequestActive {
             processPassiveRestLocationRequestUpdates(locations)
         } else if isAutoStartVerificationActive {
@@ -1653,10 +1613,6 @@ extension LocationTracker: CLLocationManagerDelegate {
 
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         Task { @MainActor in
-            if pendingDebugLocationScan {
-                logDebugEvent("debug location scan failed: \((error as NSError).code)")
-                pendingDebugLocationScan = false
-            }
             if isPassiveRestLocationRequestActive {
                 cancelPassiveRestLocationRequest(reason: "location error \((error as NSError).code)")
             }
