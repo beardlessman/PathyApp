@@ -666,6 +666,9 @@ private struct ExpandedMapIgnoresSafeArea: ViewModifier {
 private struct DebugDashboardView: View {
     @ObservedObject var tracker: LocationTracker
     @State private var didCopyLog = false
+    @State private var restRelocateTick = Date()
+
+    private let restRelocateRefresh = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         List {
@@ -679,9 +682,7 @@ private struct DebugDashboardView: View {
                 if let rest = tracker.debugRestCoordinate {
                     DebugRestPointMap(
                         restCoordinate: rest,
-                        userCoordinate: tracker.lastLocationSnapshot.map {
-                            CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude)
-                        },
+                        userCoordinate: tracker.freshUserCoordinateForDebug(),
                         showGeofence: tracker.debugGeofenceActive
                     )
                     .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
@@ -691,12 +692,17 @@ private struct DebugDashboardView: View {
                     } else {
                         debugRow("rest created", "n/a")
                     }
+                    debugRow("rest reason", tracker.debugRestCreatedReason ?? "n/a")
                 } else {
                     debugRow("rest point", "n/a")
                 }
-                if let distance = tracker.debugDistanceToRest {
+                if let distance = freshDistanceToRest {
                     debugRow("distance to rest", String(format: "%.1f m", distance))
+                } else {
+                    debugRow("distance to rest", "n/a (no current GPS)")
                 }
+                debugRow("motion", tracker.lastMotionSummary)
+                debugRow("until relocate", restRelocateCountdownLabel)
             }
 
             Section("Last Location") {
@@ -723,10 +729,6 @@ private struct DebugDashboardView: View {
                 } else {
                     debugRow("until auto-stop", "n/a")
                 }
-            }
-
-            Section("Motion") {
-                debugRow("activity", tracker.lastMotionSummary)
             }
 
             Section {
@@ -756,9 +758,44 @@ private struct DebugDashboardView: View {
             }
         }
         .navigationTitle("Debug")
+        .onReceive(restRelocateRefresh) { date in
+            restRelocateTick = date
+        }
         .onDisappear {
             didCopyLog = false
         }
+    }
+
+    private var restRelocateCountdownLabel: String {
+        _ = restRelocateTick
+
+        guard tracker.debugRestCoordinate != nil else { return "n/a (no rest)" }
+        guard !tracker.isTracking else { return "n/a (tracking)" }
+        guard tracker.isAutoStartEnabled else { return "n/a (auto-start off)" }
+
+        let distanceThreshold = tracker.debugRestRelocateDistanceThreshold
+        guard let distance = freshDistanceToRest else {
+            return "n/a (need current GPS)"
+        }
+        guard distance >= distanceThreshold else {
+            return String(format: "n/a (need ≥%.0fm)", distanceThreshold)
+        }
+
+        let resting = tracker.lastMotionSummary.contains("stationary")
+        guard resting else { return "n/a (need rest)" }
+
+        guard let createdAt = tracker.debugRestCreatedAt else {
+            return "n/a (no rest time)"
+        }
+
+        let required = tracker.debugRestRelocateMinAge
+        let remaining = max(0, required - Date().timeIntervalSince(createdAt))
+        return remaining > 0 ? formatDuration(remaining) : "ready"
+    }
+
+    private var freshDistanceToRest: CLLocationDistance? {
+        _ = restRelocateTick
+        return tracker.freshDistanceToRest()
     }
 
     @ViewBuilder
@@ -786,13 +823,17 @@ private struct DebugDashboardView: View {
         if let createdAt = tracker.debugRestCreatedAt {
             lines.append("restCreatedAt: \(DateFormatter.debugTimestamp.string(from: createdAt))")
         }
+        if let reason = tracker.debugRestCreatedReason {
+            lines.append("restCreatedReason: \(reason)")
+        }
         if let d = tracker.debugDistanceToRest {
             lines.append(String(format: "distanceToRest: %.1f", d))
         }
+        lines.append("motion: \(tracker.lastMotionSummary)")
+        lines.append("untilRelocate: \(restRelocateCountdownLabel)")
         if let left = tracker.debugSecondsUntilAutoStop {
             lines.append("secondsUntilAutoStop: \(Int(left.rounded()))")
         }
-        lines.append("motion: \(tracker.lastMotionSummary)")
 
         if let snapshot = tracker.lastLocationSnapshot {
             lines.append("lastLocation.source: \(snapshot.source)")

@@ -28,6 +28,7 @@ final class LocationTracker: NSObject, ObservableObject {
     @Published private(set) var debugGeofenceActive = false
     @Published private(set) var debugRestCoordinate: CLLocationCoordinate2D?
     @Published private(set) var debugRestCreatedAt: Date?
+    @Published private(set) var debugRestCreatedReason: String?
     @Published private(set) var debugDistanceToRest: CLLocationDistance?
     @Published private(set) var debugLastSignificantMovementAt: Date?
     @Published private(set) var debugSecondsUntilAutoStop: TimeInterval?
@@ -64,18 +65,39 @@ final class LocationTracker: NSObject, ObservableObject {
     private let restSeedMaxHorizontalAccuracy: CLLocationAccuracy = 80
     private let restSeedCachedLocationMaxAge: TimeInterval = 180
     private let restSeedRequestTimeout: TimeInterval = 25
-    /// Must be well outside the 100 m wake geofence before rest can move (avoids resetting mid-walk).
-    private let restRelocateMinDistanceFromRest: CLLocationDistance = 400
-    /// Flight / city change without a recorded drive segment.
-    private let restRelocateTravelDistance: CLLocationDistance = 2_500
-    private let restRelocateMinStationaryDuration: TimeInterval = 45
-    /// Car likely parked: no fresh automotive shortly before we anchor rest at the curb.
-    private let restRelocateMinTimeSinceAutomotive: TimeInterval = 45
-    private let restRelocateAutomotiveRecencyWindow: TimeInterval = 45 * 60
-    private let restRelocateTravelMinStationaryDuration: TimeInterval = 15
+    /// Minimum separation from current rest before the anchor may move.
+    private let restRelocateMinDistanceFromRest: CLLocationDistance = 200
+    /// Minimum age of the current rest before it may be relocated.
+    private let restRelocateMinAgeSinceCreated: TimeInterval = 30 * 60
+    /// Only treat `locationManager.location` as "current" within this age for relocate.
+    private let restRelocateMaxLocationAge: TimeInterval = 30
     private let gpsJumpDistanceThreshold: CLLocationDistance = 500
     private let gpsJumpTimeThreshold: TimeInterval = 10
     private let stationaryTimeout: TimeInterval = 15 * 60
+
+    var debugRestRelocateDistanceThreshold: CLLocationDistance { restRelocateMinDistanceFromRest }
+    var debugRestRelocateMinAge: TimeInterval { restRelocateMinAgeSinceCreated }
+    var debugRestRelocateMaxLocationAge: TimeInterval { restRelocateMaxLocationAge }
+
+    /// Distance from Rest to a *current* GPS fix only (age ≤ `restRelocateMaxLocationAge`).
+    /// Does not use `lastLocationSnapshot` — matches relocate docs.
+    func freshDistanceToRest() -> CLLocationDistance? {
+        guard let rest = loadRestLocation() else { return nil }
+        guard let current = locationManager.location,
+              isLocationAcceptableForRestSeed(current, maxAge: restRelocateMaxLocationAge) else {
+            return nil
+        }
+        return current.distance(from: rest)
+    }
+
+    /// Current coordinate only when the fix is fresh enough for relocate decisions.
+    func freshUserCoordinateForDebug() -> CLLocationCoordinate2D? {
+        guard let current = locationManager.location,
+              isLocationAcceptableForRestSeed(current, maxAge: restRelocateMaxLocationAge) else {
+            return nil
+        }
+        return current.coordinate
+    }
     /// Progressive filter QA: set each to `true` to match production gates step by step.
     private let appendFilter_wallClockSkew = true
     private let appendFilter_horizontalAccuracy = true
@@ -116,6 +138,7 @@ final class LocationTracker: NSObject, ObservableObject {
     private let restLatitudeKey = "restLatitude"
     private let restLongitudeKey = "restLongitude"
     private let restTimestampKey = "restTimestamp"
+    private let restCreatedReasonKey = "restCreatedReason"
     private let passiveGeofenceIdentifier = "resting-geofence"
     private let didAskTrackingNotificationPermissionKey = "didAskTrackingNotificationPermission"
     private let lastAlwaysLocationEducationNotificationKey = "lastAlwaysLocationEducationNotificationAt"
@@ -135,8 +158,6 @@ final class LocationTracker: NSObject, ObservableObject {
     private var autoStartVerificationTimeoutWorkItem: DispatchWorkItem?
     private var isPassiveRestLocationRequestActive = false
     private var passiveRestLocationRequestTimeoutWorkItem: DispatchWorkItem?
-    private var lastAutomotiveActivityAt: Date?
-    private var passiveStationarySince: Date?
 
     private override init() {
         super.init()
@@ -794,22 +815,28 @@ final class LocationTracker: NSObject, ObservableObject {
             location = locationManager.location
         }
         guard let location else { return }
-        persistRestLocation(location)
+        persistRestLocation(location, reason: "tracking stopped")
     }
 
-    private func persistRestLocation(_ location: CLLocation) {
+    private func persistRestLocation(_ location: CLLocation, reason: String) {
         let defaults = UserDefaults.standard
         defaults.set(location.coordinate.latitude, forKey: restLatitudeKey)
         defaults.set(location.coordinate.longitude, forKey: restLongitudeKey)
         defaults.set(location.timestamp.timeIntervalSince1970, forKey: restTimestampKey)
-        refreshRestDebugFields(from: location)
+        defaults.set(reason, forKey: restCreatedReasonKey)
+        refreshRestDebugFields(from: location, reason: reason)
         createRestGeofence(center: location.coordinate)
         logDebugEvent("rest location persisted")
     }
 
-    private func refreshRestDebugFields(from location: CLLocation) {
+    private func refreshRestDebugFields(from location: CLLocation, reason: String? = nil) {
         debugRestCoordinate = location.coordinate
         debugRestCreatedAt = location.timestamp == .distantPast ? nil : location.timestamp
+        if let reason {
+            debugRestCreatedReason = reason
+        } else {
+            debugRestCreatedReason = UserDefaults.standard.string(forKey: restCreatedReasonKey)
+        }
     }
 
     /// Seeds or relocates the passive rest anchor (no track) so auto-start stays valid after drives / travel.
@@ -840,32 +867,17 @@ final class LocationTracker: NSObject, ObservableObject {
 
     private func evaluateRestRelocationIfNeeded(trigger: String) {
         guard loadRestLocation() != nil else { return }
-        guard mightNeedRestRelocationSoon() else { return }
+        guard canRelocateRestNow() else { return }
 
-        if let cached = locationManager.location,
-           isLocationAcceptableForRestSeed(cached, maxAge: restSeedCachedLocationMaxAge),
-           shouldRelocateRest(to: cached) {
-            establishRestLocation(from: cached, trigger: "\(trigger) relocate (cached)")
+        // Prefer a truly current fix; do not gate on stale lastLocation / old cache distance.
+        if let current = locationManager.location,
+           isLocationAcceptableForRestSeed(current, maxAge: restRelocateMaxLocationAge),
+           shouldRelocateRest(to: current) {
+            establishRestLocation(from: current, trigger: "\(trigger) relocate (current)")
             return
         }
 
         beginPassiveRestLocationRequest(trigger: "\(trigger) relocate")
-    }
-
-    private func mightNeedRestRelocationSoon() -> Bool {
-        guard let rest = loadRestLocation() else { return false }
-
-        if let cached = locationManager.location,
-           cached.distance(from: rest) >= restRelocateMinDistanceFromRest {
-            return true
-        }
-
-        if let automotiveAt = lastAutomotiveActivityAt,
-           Date().timeIntervalSince(automotiveAt) <= restRelocateAutomotiveRecencyWindow {
-            return true
-        }
-
-        return passiveStationarySince != nil
     }
 
     private func isLocationAcceptableForRestSeed(_ location: CLLocation, maxAge: TimeInterval? = nil) -> Bool {
@@ -889,8 +901,8 @@ final class LocationTracker: NSObject, ObservableObject {
 
         cancelPassiveRestLocationRequest(reason: "rest established")
         cancelAutoStartVerificationIfActive(reason: "rest established")
-        persistRestLocation(location)
-        updateDistanceToRest(from: location)
+        persistRestLocation(location, reason: trigger)
+        updateDebugLocationSnapshot(location, source: "rest-establish")
         startPassiveMonitoringIfAuthorized()
         logDebugEvent("rest established (\(trigger), ±\(Int(location.horizontalAccuracy))m)")
     }
@@ -898,41 +910,27 @@ final class LocationTracker: NSObject, ObservableObject {
     private func shouldRelocateRest(to location: CLLocation) -> Bool {
         guard let rest = loadRestLocation() else { return false }
         guard !isAutoStartVerificationActive else { return false }
-
-        let distance = location.distance(from: rest)
-        guard distance >= restRelocateMinDistanceFromRest else { return false }
-
-        if isAmbulatoryMotionForRestRelocate() {
-            return false
-        }
-
-        if distance >= restRelocateTravelDistance {
-            return hasBeenStationaryLongEnough(forTravelRelocate: true)
-        }
-
-        return qualifiesForParkedAfterDriveRelocate()
+        guard location.distance(from: rest) >= restRelocateMinDistanceFromRest else { return false }
+        return canRelocateRestNow()
     }
 
-    /// Do not move rest while the user is on foot away from the old anchor — auto-start needs that baseline.
-    private func isAmbulatoryMotionForRestRelocate() -> Bool {
+    /// Rest may move when idle (not tracking), Motion reports rest, and the anchor is old enough.
+    private func canRelocateRestNow() -> Bool {
+        guard !isTracking else { return false }
+        guard isMotionIndicatingRest() else { return false }
+        return hasRestAgedEnoughForRelocate()
+    }
+
+    private func isMotionIndicatingRest() -> Bool {
         guard let activity = latestMotionActivity else { return false }
         guard activity.confidence != .low else { return false }
-        return activity.walking || activity.running || activity.cycling
+        return activity.stationary
     }
 
-    private func qualifiesForParkedAfterDriveRelocate() -> Bool {
-        guard let automotiveAt = lastAutomotiveActivityAt else { return false }
-        guard Date().timeIntervalSince(automotiveAt) <= restRelocateAutomotiveRecencyWindow else { return false }
-        guard Date().timeIntervalSince(automotiveAt) >= restRelocateMinTimeSinceAutomotive else { return false }
-        return hasBeenStationaryLongEnough(forTravelRelocate: false)
-    }
-
-    private func hasBeenStationaryLongEnough(forTravelRelocate travel: Bool) -> Bool {
-        let required = travel ? restRelocateTravelMinStationaryDuration : restRelocateMinStationaryDuration
-        guard let activity = latestMotionActivity else { return travel }
-        guard activity.stationary, activity.confidence != .low else { return false }
-        guard let since = passiveStationarySince else { return false }
-        return Date().timeIntervalSince(since) >= required
+    private func hasRestAgedEnoughForRelocate() -> Bool {
+        guard let rest = loadRestLocation() else { return false }
+        guard rest.timestamp != .distantPast else { return false }
+        return Date().timeIntervalSince(rest.timestamp) >= restRelocateMinAgeSinceCreated
     }
 
     private func beginPassiveRestLocationRequest(trigger: String) {
@@ -967,9 +965,16 @@ final class LocationTracker: NSObject, ObservableObject {
 
             if loadRestLocation() == nil {
                 establishRestLocation(from: location, trigger: "location seed")
-            } else if shouldRelocateRest(to: location) {
-                establishRestLocation(from: location, trigger: "location relocate")
+                return
             }
+
+            if shouldRelocateRest(to: location) {
+                establishRestLocation(from: location, trigger: "location relocate")
+                return
+            }
+
+            // Fresh fix proves user is still near rest — stop waiting for more updates.
+            cancelPassiveRestLocationRequest(reason: "still near rest")
             return
         }
     }
@@ -997,34 +1002,23 @@ final class LocationTracker: NSObject, ObservableObject {
         guard isAutoStartEnabled, !isTracking else { return }
 
         if activity.automotive {
-            lastAutomotiveActivityAt = .now
-            passiveStationarySince = nil
             return
         }
 
         if activity.walking || activity.running || activity.cycling {
-            passiveStationarySince = nil
             return
         }
 
         if activity.stationary, activity.confidence != .low {
-            if passiveStationarySince == nil {
-                passiveStationarySince = .now
-            }
             tryRelocateRestAfterMotionSettled()
             return
         }
-
-        passiveStationarySince = nil
     }
 
     private func tryRelocateRestAfterMotionSettled() {
         guard loadRestLocation() != nil else { return }
         guard !isAutoStartVerificationActive else { return }
-
-        let travelReady = hasBeenStationaryLongEnough(forTravelRelocate: true)
-        let parkedReady = qualifiesForParkedAfterDriveRelocate()
-        guard travelReady || parkedReady else { return }
+        guard canRelocateRestNow() else { return }
 
         evaluateRestRelocationIfNeeded(trigger: "motion settled")
     }
