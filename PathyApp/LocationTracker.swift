@@ -184,10 +184,14 @@ final class LocationTracker: NSObject, ObservableObject {
         self.modelContext = modelContext
         restoreActiveTrackingIfNeeded()
         restorePassiveMonitoringIfNeeded()
-        maintainPassiveRestPointIfNeeded(trigger: "model context attached")
         resumePendingPostProcessingIfNeeded()
+        // Flush geofence-exit verification before any rest relocate — otherwise relocate
+        // moves the anchor to the user and auto-start never confirms leaving rest.
         if wasMissing || pendingAutoStartVerification {
             flushPendingAutoStartVerificationIfNeeded()
+        }
+        if !isAutoStartVerificationActive, !pendingAutoStartVerification {
+            maintainPassiveRestPointIfNeeded(trigger: "model context attached")
         }
     }
 
@@ -208,15 +212,19 @@ final class LocationTracker: NSObject, ObservableObject {
         // Attach store before restoring geofence so a queued region exit can start verification.
         ensureModelContextAttachedFromPersistence()
         restorePassiveMonitoringIfNeeded()
-        maintainPassiveRestPointIfNeeded(trigger: "app launch")
         flushPendingAutoStartVerificationIfNeeded()
+        if !isAutoStartVerificationActive, !pendingAutoStartVerification {
+            maintainPassiveRestPointIfNeeded(trigger: "app launch")
+        }
     }
 
     func handleAppBecameActive() {
         ensureModelContextAttachedFromPersistence()
-        maintainPassiveRestPointIfNeeded(trigger: "app became active")
-        resumePendingPostProcessingIfNeeded()
         flushPendingAutoStartVerificationIfNeeded()
+        if !isAutoStartVerificationActive, !pendingAutoStartVerification {
+            maintainPassiveRestPointIfNeeded(trigger: "app became active")
+        }
+        resumePendingPostProcessingIfNeeded()
     }
 
     private func ensureModelContextAttachedFromPersistence() {
@@ -863,6 +871,7 @@ final class LocationTracker: NSObject, ObservableObject {
         guard !isTracking else { return }
         guard authorizationStatus == .authorizedAlways else { return }
         guard !isAutoStartVerificationActive else { return }
+        guard !pendingAutoStartVerification else { return }
 
         if loadRestLocation() == nil {
             seedRestLocationIfNeeded(trigger: trigger)
@@ -935,6 +944,8 @@ final class LocationTracker: NSObject, ObservableObject {
     /// Rest may move when idle (not tracking), Motion reports rest, and the anchor is old enough.
     private func canRelocateRestNow() -> Bool {
         guard !isTracking else { return false }
+        guard !isAutoStartVerificationActive else { return false }
+        guard !pendingAutoStartVerification else { return false }
         guard isMotionIndicatingRest() else { return false }
         return hasRestAgedEnoughForRelocate()
     }
