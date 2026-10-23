@@ -515,7 +515,7 @@ final class LocationTracker: NSObject, ObservableObject {
             cancelPassiveRestLocationRequest(reason: "auto-start disabled")
             pendingAutoStartLocation = nil
             cancelAutoStartVerificationIfActive(reason: "auto-start disabled")
-            locationManager.stopMonitoringSignificantLocationChanges()
+            stopPassiveVisitAndSignificantMonitoring()
             stopRestGeofenceIfNeeded()
         }
     }
@@ -788,11 +788,17 @@ final class LocationTracker: NSObject, ObservableObject {
         guard isAutoStartEnabled else { return }
         guard authorizationStatus == .authorizedAlways else { return }
         restoreRestGeofenceIfPossible()
+        locationManager.startMonitoringVisits()
         if loadRestLocation() != nil {
             locationManager.startMonitoringSignificantLocationChanges()
         } else {
             locationManager.stopMonitoringSignificantLocationChanges()
         }
+    }
+
+    private func stopPassiveVisitAndSignificantMonitoring() {
+        locationManager.stopMonitoringVisits()
+        locationManager.stopMonitoringSignificantLocationChanges()
     }
 
     private func restoreRestGeofenceIfPossible() {
@@ -1011,9 +1017,15 @@ final class LocationTracker: NSObject, ObservableObject {
     private func processPassiveRestRelocationCandidateUpdates(_ locations: [CLLocation]) {
         guard let location = locations.last else { return }
         updateDebugLocationSnapshot(location, source: "passive-sigloc")
-        guard isLocationAcceptableForRestSeed(location) else { return }
-        guard shouldRelocateRest(to: location) else { return }
-        establishRestLocation(from: location, trigger: "significant location")
+        // Full pipeline (may requestLocation) — not only this possibly-stale significant fix.
+        evaluateRestRelocationIfNeeded(trigger: "significant location")
+    }
+
+    /// OS wake that may mean the user settled elsewhere (visit / post-verification).
+    private func evaluateRestRelocationAfterWake(trigger: String) {
+        guard !isAutoStartVerificationActive else { return }
+        guard !pendingAutoStartVerification else { return }
+        maintainPassiveRestPointIfNeeded(trigger: trigger)
     }
 
     private var canEvaluatePassiveRestRelocationFromLocationUpdates: Bool {
@@ -1143,6 +1155,15 @@ final class LocationTracker: NSObject, ObservableObject {
         locationManager.activityType = .fitness
         applyEconomyLocationConfig()
         logDebugEvent("auto-start verification off (\(reason))")
+
+        // After a failed/aborted leave-home check, rest may need to move if user settled elsewhere.
+        let shouldCheckRelocate =
+            reason == "timeout"
+            || reason.hasPrefix("re-entered")
+            || reason.hasPrefix("location error")
+        if shouldCheckRelocate {
+            evaluateRestRelocationAfterWake(trigger: "after verification (\(reason))")
+        }
     }
 
     private func processAutoStartVerificationUpdates(_ locations: [CLLocation]) {
@@ -1656,6 +1677,42 @@ extension LocationTracker: CLLocationManagerDelegate {
             logDebugEvent("passive geofence re-entry → cancel verification")
             cancelAutoStartVerificationIfActive(reason: "re-entered rest region")
         }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didVisit visit: CLVisit) {
+        Task { @MainActor in
+            handleVisit(visit)
+        }
+    }
+
+    private func handleVisit(_ visit: CLVisit) {
+        let stillAtPlace = visit.departureDate == .distantFuture
+        let kind = stillAtPlace ? "arrival" : "departure"
+        logDebugEvent(
+            String(
+                format: "visit \(kind) (±%.0fm)",
+                visit.horizontalAccuracy
+            )
+        )
+
+        guard isAutoStartEnabled, !isTracking else { return }
+        guard !isAutoStartVerificationActive, !pendingAutoStartVerification else { return }
+
+        // Arrival / completed stay: user likely settled — run relocate pipeline (fresh GPS if needed).
+        // Departure alone is not enough to move rest.
+        guard stillAtPlace || visit.departureDate.timeIntervalSince(visit.arrivalDate) >= 60 else {
+            return
+        }
+
+        let visitLocation = CLLocation(
+            coordinate: visit.coordinate,
+            altitude: 0,
+            horizontalAccuracy: visit.horizontalAccuracy,
+            verticalAccuracy: -1,
+            timestamp: stillAtPlace ? visit.arrivalDate : visit.departureDate
+        )
+        updateDebugLocationSnapshot(visitLocation, source: "visit-\(kind)")
+        evaluateRestRelocationAfterWake(trigger: "visit \(kind)")
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
