@@ -11,7 +11,7 @@ enum PersistenceController {
 
     static let sharedContainer: ModelContainer = {
         do {
-            let schema = Schema([Track.self])
+            let schema = Schema([Track.self, ExploredHex.self])
             let baseURL = try FileManager.default.url(
                 for: .applicationSupportDirectory,
                 in: .userDomainMask,

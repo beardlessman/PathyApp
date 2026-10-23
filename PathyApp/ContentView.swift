@@ -16,6 +16,7 @@ struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var tracker: LocationTracker
+    @StateObject private var exploredHexStore = ExploredHexStore()
     @State private var tracks: [Track] = []
 
     @State private var trackDisplayStates: [UUID: TrackDisplayState] = [:]
@@ -32,9 +33,11 @@ struct ContentView: View {
     @State private var editingTrackName = ""
     @State private var isMapExpanded = false
     @State private var shouldFollowUserOnMap = true
+    @State private var showTracksScreen = false
 
     private var isBusy: Bool {
-        isImportingTrack || isDeletingTracks || postProcessingTrackID != nil || tracker.isPostProcessingTrack
+        isImportingTrack || isDeletingTracks || exploredHexStore.isReindexing
+            || postProcessingTrackID != nil || tracker.isPostProcessingTrack
     }
 
     private var isProcessingTrack: Bool {
@@ -262,48 +265,55 @@ struct ContentView: View {
         }
     }
 
+    @ViewBuilder
+    private var mainTracksView: some View {
+        VStack(spacing: isMapExpanded ? 0 : 12) {
+            mapAndControlsSection
+                .frame(maxHeight: .infinity)
+
+            if !isMapExpanded {
+                collapsedMapChrome
+            }
+        }
+        .padding(isMapExpanded ? 0 : 16)
+        .navigationTitle("Pathy")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                NavigationLink {
+                    SettingsView(
+                        tracker: tracker,
+                        isAutoStartEnabled: tracker.isAutoStartEnabled,
+                        setAutoStartEnabled: { tracker.setAutoStartEnabled($0) },
+                        onImportGPX: { isImporting = true },
+                        onExportGPX: exportAllTracks,
+                        canExportGPX: !tracks.isEmpty,
+                        isBusy: isBusy,
+                        savedTracksApproximateByteCount: approximateSavedTracksTotalBytes,
+                        onDeleteAllTracks: deleteAllTracks,
+                        canBulkDeleteAllTracks: !tracks.isEmpty && !tracker.isTracking,
+                        trackingBlocksBulkDeleteAll: tracker.isTracking && !tracks.isEmpty
+                    )
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+            }
+        }
+        .toolbar(isMapExpanded ? .hidden : .automatic, for: .navigationBar)
+    }
+
     var body: some View {
         NavigationStack {
-            VStack(spacing: isMapExpanded ? 0 : 12) {
-                mapAndControlsSection
-                    .frame(maxHeight: .infinity)
-
-                if !isMapExpanded {
-                    collapsedMapChrome
-                }
+            DiscoveryMapScreen(
+                exploredHexStore: exploredHexStore,
+                initialRegion: nil,
+                onOpenTracks: { showTracksScreen = true }
+            )
+            .navigationDestination(isPresented: $showTracksScreen) {
+                mainTracksView
             }
-            .padding(isMapExpanded ? 0 : 16)
-            .navigationTitle("Pathy")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    NavigationLink {
-                        DebugDashboardView(tracker: tracker)
-                    } label: {
-                        Image(systemName: "ladybug")
-                    }
-                }
-
-                ToolbarItem(placement: .topBarTrailing) {
-                    NavigationLink {
-                        SettingsView(
-                            isAutoStartEnabled: tracker.isAutoStartEnabled,
-                            setAutoStartEnabled: { tracker.setAutoStartEnabled($0) },
-                            onImportGPX: { isImporting = true },
-                            onExportGPX: exportAllTracks,
-                            canExportGPX: !tracks.isEmpty,
-                            isBusy: isBusy,
-                            savedTracksApproximateByteCount: approximateSavedTracksTotalBytes,
-                            onDeleteAllTracks: deleteAllTracks,
-                            canBulkDeleteAllTracks: !tracks.isEmpty && !tracker.isTracking,
-                            trackingBlocksBulkDeleteAll: tracker.isTracking && !tracks.isEmpty
-                        )
-                    } label: {
-                        Image(systemName: "gearshape")
-                    }
-                }
-            }
-            .toolbar(isMapExpanded ? .hidden : .automatic, for: .navigationBar)
+            .toolbar(.hidden, for: .navigationBar)
+        }
             .fileImporter(
                 isPresented: $isImporting,
                 allowedContentTypes: [.xml, .gpx],
@@ -331,11 +341,14 @@ struct ContentView: View {
             })
             .onAppear {
                 tracker.attach(modelContext: modelContext)
+                exploredHexStore.attach(modelContext: modelContext)
                 tracker.requestPermissions()
                 tracker.onCoordinateRecorded = { coordinate in
                     autoCacheAroundTrackingCoordinate(coordinate)
+                    exploredHexStore.indexCoordinate(coordinate, throttle: true)
                 }
                 refreshTracks()
+                exploredHexStore.backfillFromTracksIfNeeded()
                 syncSelectionWithTracks()
             }
             .onChange(of: scenePhase) { _, newPhase in
@@ -344,12 +357,17 @@ struct ContentView: View {
                     refreshTracks()
                 }
             }
+            .onChange(of: tracker.isTracking) { wasTracking, isTracking in
+                guard wasTracking, !isTracking else { return }
+                exploredHexStore.reindexFromAllTracks()
+            }
             .onChange(of: tracker.isPostProcessingTrack) { _, isProcessing in
                 guard !isProcessing else { return }
                 if let currentTrack = tracker.currentTrack {
                     upsertLocalTrack(currentTrack)
                 }
                 refreshTracks()
+                exploredHexStore.reindexFromAllTracks()
             }
             .animation(nil, value: isMapExpanded)
             .overlay {
@@ -359,7 +377,9 @@ struct ContentView: View {
                         ProgressView(
                             isProcessingTrack
                                 ? "Processing track..."
-                                : (isDeletingTracks ? "Deleting track..." : "Importing GPX...")
+                                : (exploredHexStore.isReindexing
+                                    ? "Updating discovery map..."
+                                    : (isDeletingTracks ? "Deleting track..." : "Importing GPX..."))
                         )
                             .padding(.horizontal, 20)
                             .padding(.vertical, 14)
@@ -368,7 +388,6 @@ struct ContentView: View {
                     }
                 }
             }
-        }
     }
 
     private func importTracks(urls: [URL]) {
@@ -395,12 +414,14 @@ struct ContentView: View {
                 }
                 refreshTracks()
                 syncSelectionWithTracks()
+                exploredHexStore.reindexFromAllTracks()
             } catch let batchError as GPXBatchImportError {
                 for track in batchError.partiallyImported {
                     upsertLocalTrack(track)
                 }
                 refreshTracks()
                 syncSelectionWithTracks()
+                exploredHexStore.reindexFromAllTracks()
                 exportError = batchError.localizedDescription
             } catch {
                 exportError = "Unable to import GPX: \(error.localizedDescription)"
@@ -443,6 +464,7 @@ struct ContentView: View {
             modelContext.delete(track)
         }
         try modelContext.save()
+        exploredHexStore.reindexFromAllTracks()
         refreshTracks()
         syncSelectionWithTracks()
     }
@@ -456,6 +478,7 @@ struct ContentView: View {
                 knownTrackIDs.remove(track.id)
                 modelContext.delete(track)
                 try modelContext.save()
+                exploredHexStore.reindexFromAllTracks()
                 tracks.removeAll { $0.id == track.id }
                 refreshTracks()
                 syncSelectionWithTracks()
@@ -485,6 +508,7 @@ struct ContentView: View {
             do {
                 try modelContext.save()
                 upsertLocalTrack(track)
+                exploredHexStore.reindexFromAllTracks()
             } catch {
                 exportError = "Unable to save processed track: \(error.localizedDescription)"
             }
@@ -641,33 +665,56 @@ private struct ExpandedMapIgnoresSafeArea: ViewModifier {
 
 private struct DebugDashboardView: View {
     @ObservedObject var tracker: LocationTracker
-    @State private var batteryLevel: Float = UIDevice.current.batteryLevel
-    @State private var batterySamples: [(date: Date, level: Float)] = []
     @State private var didCopyLog = false
+    @State private var restRelocateTick = Date()
 
-    private let refreshTimer = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
+    private let restRelocateRefresh = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         List {
             Section("Tracking") {
                 debugRow("isTracking", tracker.isTracking ? "true" : "false")
-                debugRow("isPaused", tracker.isPaused ? "true" : "false")
                 debugRow("live points", "\(tracker.liveTrackCoordinates.count)")
-                debugRow("desiredAccuracy", String(format: "%.0f", tracker.debugDesiredAccuracy))
-                debugRow("distanceFilter", String(format: "%.1f m", tracker.debugDistanceFilter))
-                debugRow("deferred", "\(Int(tracker.debugDeferredDistance))m / \(Int(tracker.debugDeferredTimeout))s")
             }
 
             Section("Rest / Geofence") {
                 debugRow("geofence", tracker.debugGeofenceActive ? "active" : "inactive")
                 if let rest = tracker.debugRestCoordinate {
-                    debugRow("rest lat", String(format: "%.6f", rest.latitude))
-                    debugRow("rest lon", String(format: "%.6f", rest.longitude))
+                    DebugRestPointMap(
+                        restCoordinate: rest,
+                        userCoordinate: tracker.freshUserCoordinateForDebug(),
+                        showGeofence: tracker.debugGeofenceActive
+                    )
+                    .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+
+                    if let createdAt = tracker.debugRestCreatedAt {
+                        debugRow("rest created", DateFormatter.debugTimestamp.string(from: createdAt))
+                    } else {
+                        debugRow("rest created", "n/a")
+                    }
+                    debugRow("rest reason", tracker.debugRestCreatedReason ?? "n/a")
                 } else {
                     debugRow("rest point", "n/a")
                 }
-                if let distance = tracker.debugDistanceToRest {
+                if let distance = freshDistanceToRest {
                     debugRow("distance to rest", String(format: "%.1f m", distance))
+                } else {
+                    debugRow("distance to rest", "n/a (no current GPS)")
+                }
+                debugRow("motion", tracker.lastMotionSummary)
+                debugRow("until relocate", restRelocateCountdownLabel)
+            }
+
+            Section("Last Location") {
+                if let snapshot = tracker.lastLocationSnapshot {
+                    debugRow("source", snapshot.source)
+                    debugRow("timestamp", DateFormatter.debugTimestamp.string(from: snapshot.timestamp))
+                    NavigationLink("View Full Snapshot") {
+                        DebugLocationSnapshotView(snapshot: snapshot)
+                    }
+                } else {
+                    Text("No location yet")
+                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -681,49 +728,6 @@ private struct DebugDashboardView: View {
                     debugRow("until auto-stop", formatDuration(left))
                 } else {
                     debugRow("until auto-stop", "n/a")
-                }
-            }
-
-            Section("GPS Quality") {
-                if let median = tracker.debugMedianHorizontalAccuracy {
-                    debugRow("median hAcc", String(format: "%.1f m", median))
-                } else {
-                    debugRow("median hAcc", "n/a")
-                }
-                if let share = tracker.debugPoorAccuracyShare {
-                    debugRow("poor fixes (>30m)", String(format: "%.0f%%", share * 100))
-                } else {
-                    debugRow("poor fixes (>30m)", "n/a")
-                }
-            }
-
-            Section("Battery Impact Hints") {
-                debugRow("level", formatBatteryLevel())
-                if let drain = estimatedDrainPerHour() {
-                    debugRow("drain estimate", String(format: "%.1f%%/h", drain))
-                } else {
-                    debugRow("drain estimate", "collecting...")
-                }
-            }
-
-            Section("Motion") {
-                debugRow("activity", tracker.lastMotionSummary)
-            }
-
-            Section("Last Location") {
-                if let snapshot = tracker.lastLocationSnapshot {
-                    debugRow("source", snapshot.source)
-                    debugRow("timestamp", DateFormatter.debugTimestamp.string(from: snapshot.timestamp))
-                    debugRow("lat", String(format: "%.6f", snapshot.latitude))
-                    debugRow("lon", String(format: "%.6f", snapshot.longitude))
-                    debugRow("speed", snapshot.speed >= 0 ? String(format: "%.2f m/s", snapshot.speed) : "n/a")
-                    debugRow("course", snapshot.course >= 0 ? String(format: "%.1f°", snapshot.course) : "n/a")
-                    debugRow("hAccuracy", String(format: "%.1f m", snapshot.horizontalAccuracy))
-                    debugRow("vAccuracy", snapshot.verticalAccuracy >= 0 ? String(format: "%.1f m", snapshot.verticalAccuracy) : "n/a")
-                    debugRow("altitude", String(format: "%.1f m", snapshot.altitude))
-                } else {
-                    Text("No location yet")
-                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -754,17 +758,44 @@ private struct DebugDashboardView: View {
             }
         }
         .navigationTitle("Debug")
-        .onAppear {
-            UIDevice.current.isBatteryMonitoringEnabled = true
-            refreshBattery()
-            tracker.requestDebugLocationScan()
-        }
-        .onReceive(refreshTimer) { _ in
-            refreshBattery()
+        .onReceive(restRelocateRefresh) { date in
+            restRelocateTick = date
         }
         .onDisappear {
             didCopyLog = false
         }
+    }
+
+    private var restRelocateCountdownLabel: String {
+        _ = restRelocateTick
+
+        guard tracker.debugRestCoordinate != nil else { return "n/a (no rest)" }
+        guard !tracker.isTracking else { return "n/a (tracking)" }
+        guard tracker.isAutoStartEnabled else { return "n/a (auto-start off)" }
+
+        let distanceThreshold = tracker.debugRestRelocateDistanceThreshold
+        guard let distance = freshDistanceToRest else {
+            return "n/a (need current GPS)"
+        }
+        guard distance >= distanceThreshold else {
+            return String(format: "n/a (need ≥%.0fm)", distanceThreshold)
+        }
+
+        let resting = tracker.lastMotionSummary.contains("stationary")
+        guard resting else { return "n/a (need rest)" }
+
+        guard let createdAt = tracker.debugRestCreatedAt else {
+            return "n/a (no rest time)"
+        }
+
+        let required = tracker.debugRestRelocateMinAge
+        let remaining = max(0, required - Date().timeIntervalSince(createdAt))
+        return remaining > 0 ? formatDuration(remaining) : "ready"
+    }
+
+    private var freshDistanceToRest: CLLocationDistance? {
+        _ = restRelocateTick
+        return tracker.freshDistanceToRest()
     }
 
     @ViewBuilder
@@ -779,60 +810,29 @@ private struct DebugDashboardView: View {
         }
     }
 
-    private func refreshBattery() {
-        batteryLevel = UIDevice.current.batteryLevel
-        guard batteryLevel >= 0 else { return }
-
-        let now = Date()
-        batterySamples.append((date: now, level: batteryLevel))
-        let cutoff = now.addingTimeInterval(-30 * 60)
-        batterySamples.removeAll { $0.date < cutoff }
-    }
-
-    private func formatBatteryLevel() -> String {
-        guard batteryLevel >= 0 else { return "n/a" }
-        return "\(Int((batteryLevel * 100).rounded()))%"
-    }
-
-    private func estimatedDrainPerHour() -> Double? {
-        guard let first = batterySamples.first, let last = batterySamples.last else { return nil }
-        let dt = last.date.timeIntervalSince(first.date)
-        guard dt >= 5 * 60 else { return nil }
-        let delta = Double(first.level - last.level) * 100
-        return max(0, delta / (dt / 3600))
-    }
-
-
     private func buildDebugReport() -> String {
         var lines: [String] = []
         lines.append("Pathy Debug Report")
         lines.append("generatedAt: \(DateFormatter.debugTimestamp.string(from: .now))")
         lines.append("isTracking: \(tracker.isTracking)")
-        lines.append("isPaused: \(tracker.isPaused)")
         lines.append("livePoints: \(tracker.liveTrackCoordinates.count)")
-        lines.append(String(format: "desiredAccuracy: %.0f", tracker.debugDesiredAccuracy))
-        lines.append(String(format: "distanceFilter: %.1f", tracker.debugDistanceFilter))
-        lines.append("deferred: \(Int(tracker.debugDeferredDistance))m / \(Int(tracker.debugDeferredTimeout))s")
         lines.append("geofenceActive: \(tracker.debugGeofenceActive)")
         if let rest = tracker.debugRestCoordinate {
             lines.append(String(format: "restCoordinate: %.6f, %.6f", rest.latitude, rest.longitude))
         }
+        if let createdAt = tracker.debugRestCreatedAt {
+            lines.append("restCreatedAt: \(DateFormatter.debugTimestamp.string(from: createdAt))")
+        }
+        if let reason = tracker.debugRestCreatedReason {
+            lines.append("restCreatedReason: \(reason)")
+        }
         if let d = tracker.debugDistanceToRest {
             lines.append(String(format: "distanceToRest: %.1f", d))
         }
+        lines.append("motion: \(tracker.lastMotionSummary)")
+        lines.append("untilRelocate: \(restRelocateCountdownLabel)")
         if let left = tracker.debugSecondsUntilAutoStop {
             lines.append("secondsUntilAutoStop: \(Int(left.rounded()))")
-        }
-        if let median = tracker.debugMedianHorizontalAccuracy {
-            lines.append(String(format: "medianHAcc: %.1f", median))
-        }
-        if let share = tracker.debugPoorAccuracyShare {
-            lines.append(String(format: "poorAccuracyShare: %.2f", share))
-        }
-        lines.append("motion: \(tracker.lastMotionSummary)")
-        lines.append("batteryLevel: \(formatBatteryLevel())")
-        if let drain = estimatedDrainPerHour() {
-            lines.append(String(format: "batteryDrainPerHour: %.1f", drain))
         }
 
         if let snapshot = tracker.lastLocationSnapshot {
@@ -840,11 +840,6 @@ private struct DebugDashboardView: View {
             lines.append("lastLocation.timestamp: \(DateFormatter.debugTimestamp.string(from: snapshot.timestamp))")
             lines.append(String(format: "lastLocation.lat: %.6f", snapshot.latitude))
             lines.append(String(format: "lastLocation.lon: %.6f", snapshot.longitude))
-            lines.append(String(format: "lastLocation.speed: %.2f", snapshot.speed))
-            lines.append(String(format: "lastLocation.course: %.1f", snapshot.course))
-            lines.append(String(format: "lastLocation.hAcc: %.1f", snapshot.horizontalAccuracy))
-            lines.append(String(format: "lastLocation.vAcc: %.1f", snapshot.verticalAccuracy))
-            lines.append(String(format: "lastLocation.alt: %.1f", snapshot.altitude))
         }
 
         lines.append("events:")
@@ -860,6 +855,145 @@ private struct DebugDashboardView: View {
     }
 }
 
+private struct DebugLocationSnapshotView: View {
+    let snapshot: LocationDebugSnapshot
+
+    var body: some View {
+        List {
+            snapshotRow("source", snapshot.source)
+            snapshotRow("timestamp", DateFormatter.debugTimestamp.string(from: snapshot.timestamp))
+            snapshotRow("lat", String(format: "%.6f", snapshot.latitude))
+            snapshotRow("lon", String(format: "%.6f", snapshot.longitude))
+            snapshotRow(
+                "speed",
+                snapshot.speed >= 0 ? String(format: "%.2f m/s", snapshot.speed) : "n/a"
+            )
+            snapshotRow(
+                "course",
+                snapshot.course >= 0 ? String(format: "%.1f°", snapshot.course) : "n/a"
+            )
+            snapshotRow("hAccuracy", String(format: "%.1f m", snapshot.horizontalAccuracy))
+            snapshotRow(
+                "vAccuracy",
+                snapshot.verticalAccuracy >= 0
+                    ? String(format: "%.1f m", snapshot.verticalAccuracy)
+                    : "n/a"
+            )
+            snapshotRow("altitude", String(format: "%.1f m", snapshot.altitude))
+        }
+        .navigationTitle("Location Snapshot")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func snapshotRow(_ key: String, _ value: String) -> some View {
+        HStack {
+            Text(key)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text(value)
+                .multilineTextAlignment(.trailing)
+                .font(.system(.body, design: .monospaced))
+        }
+    }
+}
+
+private struct DebugRestPointMap: View {
+    let restCoordinate: CLLocationCoordinate2D
+    let userCoordinate: CLLocationCoordinate2D?
+    let showGeofence: Bool
+
+    /// Matches `LocationTracker.passiveWakeGeofenceRadius`.
+    private let geofenceRadiusMeters: CLLocationDistance = 100
+
+    @State private var position: MapCameraPosition
+
+    init(
+        restCoordinate: CLLocationCoordinate2D,
+        userCoordinate: CLLocationCoordinate2D?,
+        showGeofence: Bool
+    ) {
+        self.restCoordinate = restCoordinate
+        self.userCoordinate = userCoordinate
+        self.showGeofence = showGeofence
+        _position = State(
+            initialValue: .region(Self.region(rest: restCoordinate, user: userCoordinate))
+        )
+    }
+
+    var body: some View {
+        Map(position: $position) {
+            Annotation("Rest", coordinate: restCoordinate) {
+                mapDot(color: .orange)
+            }
+
+            if let userCoordinate {
+                Annotation("User", coordinate: userCoordinate) {
+                    mapDot(color: .blue)
+                }
+            }
+
+            if showGeofence {
+                MapCircle(center: restCoordinate, radius: geofenceRadiusMeters)
+                    .foregroundStyle(.orange.opacity(0.12))
+                    .stroke(.orange.opacity(0.55), lineWidth: 1)
+            }
+        }
+        .frame(height: 180)
+        .mapStyle(.standard(elevation: .flat))
+        .disabled(true)
+        .onChange(of: restCoordinate.latitude) { _, _ in recenter() }
+        .onChange(of: restCoordinate.longitude) { _, _ in recenter() }
+        .onChange(of: userCoordinate?.latitude) { _, _ in recenter() }
+        .onChange(of: userCoordinate?.longitude) { _, _ in recenter() }
+    }
+
+    private func recenter() {
+        position = .region(Self.region(rest: restCoordinate, user: userCoordinate))
+    }
+
+    private func mapDot(color: Color) -> some View {
+        ZStack {
+            Circle()
+                .fill(.white)
+                .frame(width: 16, height: 16)
+            Circle()
+                .fill(color)
+                .frame(width: 10, height: 10)
+        }
+    }
+
+    private static func region(
+        rest: CLLocationCoordinate2D,
+        user: CLLocationCoordinate2D?
+    ) -> MKCoordinateRegion {
+        guard let user else {
+            return MKCoordinateRegion(
+                center: rest,
+                latitudinalMeters: 450,
+                longitudinalMeters: 450
+            )
+        }
+
+        let minLat = min(rest.latitude, user.latitude)
+        let maxLat = max(rest.latitude, user.latitude)
+        let minLon = min(rest.longitude, user.longitude)
+        let maxLon = max(rest.longitude, user.longitude)
+
+        let center = CLLocationCoordinate2D(
+            latitude: (minLat + maxLat) / 2,
+            longitude: (minLon + maxLon) / 2
+        )
+
+        let latDelta = max((maxLat - minLat) * 1.8, 0.004)
+        let lonDelta = max((maxLon - minLon) * 1.8, 0.004)
+
+        return MKCoordinateRegion(
+            center: center,
+            span: MKCoordinateSpan(latitudeDelta: latDelta, longitudeDelta: lonDelta)
+        )
+    }
+}
+
 private extension DateFormatter {
     static let debugTimestamp: DateFormatter = {
         let f = DateFormatter()
@@ -871,6 +1005,7 @@ private extension DateFormatter {
 }
 
 private struct SettingsView: View {
+    let tracker: LocationTracker
     let isAutoStartEnabled: Bool
     let setAutoStartEnabled: (Bool) -> Void
     let onImportGPX: () -> Void
@@ -1003,6 +1138,14 @@ private struct SettingsView: View {
 
                 Button("Export GPX", action: onExportGPX)
                     .disabled(isBusy || !canExportGPX)
+            }
+
+            Section {
+                NavigationLink {
+                    DebugDashboardView(tracker: tracker)
+                } label: {
+                    Label("Debug", systemImage: "ladybug")
+                }
             }
         }
         .navigationTitle("Settings")
